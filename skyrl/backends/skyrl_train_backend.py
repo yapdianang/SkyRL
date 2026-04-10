@@ -633,6 +633,15 @@ class SkyRLTrainBackend(AbstractBackend):
         if not prepared_batch.all_model_inputs:
             return {}
 
+        if self._cfg.trainer.strategy == "fsdp2":
+            req_ids = [r[0] for r in prepared_batch.request_batch_slices]
+            msg = (
+                f"[FSDP] forward_backward: n_requests={len(prepared_batch.request_batch_slices)} "
+                f"request_ids={req_ids} n_model_inputs={len(prepared_batch.all_model_inputs)}"
+            )
+            print(msg, flush=True)
+            logger.info(msg)
+
         self._sleep_inference_engines()
         results = {}
         for sub_batch in self._split_model_pass_batch_by_model_id(prepared_batch):

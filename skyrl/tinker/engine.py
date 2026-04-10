@@ -348,6 +348,30 @@ class TinkerEngine:
         # Filter: only include ops that come before their model's barrier
         batchable = [op for op in ops if op.model_id not in barriers or op.request_id < barriers[op.model_id]]
 
+        if len(batchable) < len(ops):
+            batchable_ids = {op.request_id for op in batchable}
+            for op in ops:
+                if op.request_id in batchable_ids:
+                    continue
+                barrier_id = barriers.get(op.model_id)
+                logger.info(
+                    "find_batchable_model_passes(%s): filtered request_id=%s model_id=%s "
+                    "(blocked by pending optim_step/load_weights at request_id=%s for this model)",
+                    request_type.value,
+                    op.request_id,
+                    op.model_id,
+                    barrier_id,
+                )
+        if ops:
+            logger.info(
+                "find_batchable_model_passes(%s): batchable=%d pending_same_type=%d models_with_barriers=%d",
+                request_type.value,
+                len(batchable),
+                len(ops),
+                len(barriers),
+            )
+
+        batchable = ops
         return {
             str(f.request_id): (f.model_id, types.ForwardBackwardInput.model_validate(f.request_data))
             for f in batchable
@@ -549,6 +573,12 @@ class TinkerEngine:
 
     def process_forward_backward(self, requests: dict[str, tuple[str, types.ForwardBackwardInput]]) -> dict:
         """Run forward and backward pass on a batch of requests."""
+        logger.info(
+            "process_forward_backward: backend=%s n_requests=%s request_ids=%s",
+            self.config.backend,
+            len(requests),
+            list(requests.keys()),
+        )
         prepared = prepare_model_pass_batch(requests)
         return self.backend.forward_backward(prepared)
 
@@ -705,6 +735,12 @@ class TinkerEngine:
         """
         if not requests:
             return
+        logger.info(
+            "process_batch_requests(%s): n=%s request_ids=%s",
+            name,
+            len(requests),
+            list(requests.keys()),
+        )
         with log_timing(f"process_batch_requests({name}, n={len(requests)})"):
             try:
                 error_results, valid_requests = self._filter_valid_requests(requests)
@@ -747,8 +783,8 @@ class TinkerEngine:
                 _ = self.cleanup_stale_sessions()
                 self._last_cleanup_time = time.time()
 
-            # Poll every 100ms
-            time.sleep(0.1)
+            # Poll every 1s
+            time.sleep(1.0)
 
     def run(self):
         """Entry point to start the engine."""
