@@ -325,10 +325,52 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             tensor = tensor.contiguous()
         return tensor
 
+    # WORKAROUND (chuck/try_batchable_workaround): the original code zipped
+    # full_sd.items() with meta_sharded_sd.values(), which silently truncates
+    # when full_sd (rank 0, materialized via from_pretrained) has a different
+    # number of entries than meta_sharded_sd (ranks 1-7, meta-tensor model
+    # built via from_config).  For models like openai/gpt-oss-120b that ship
+    # in MXFP4 and get dequantized to bf16 by transformers on load, the
+    # rank-0 state_dict ends up with a different structure than the
+    # meta-init state_dict on the other ranks (different param names / a
+    # different number of keys).  The zip then has rank 0 issue fewer
+    # broadcasts than ranks 1-7 expect, the NCCL collective sequence
+    # desynchronizes, and create_model hangs forever (until the watchdog
+    # SIGABRTs at NCCL timeout).
+    #
+    # Fix: iterate by the canonical sharded keys on every rank.  Rank 0
+    # looks up each key in full_sd; any key that's missing on rank 0 (e.g.
+    # dropped during MXFP4 dequant) gets broadcast as zeros.  This keeps
+    # the broadcast count identical across all ranks.
+    canonical_keys = list(meta_sharded_sd.keys())
     if dist.get_rank() == 0:
-        for (param_name, full_param), sharded_param in zip(full_sd.items(), meta_sharded_sd.values()):
-            full_param = full_param.detach().cuda()
+        full_sd_lookup = dict(full_sd)
+        missing_on_rank0 = [k for k in canonical_keys if k not in full_sd_lookup]
+        if missing_on_rank0:
+            # Don't crash — log loudly so it's obvious in the engine log,
+            # then broadcast zeros so all ranks agree on the collective
+            # sequence.  These slots will be re-initialized by the model's
+            # own _init_weights pass if/when needed.
+            print(
+                f"[fsdp2_load_full_state_dict] WARNING: rank 0 full state dict is "
+                f"missing {len(missing_on_rank0)} of {len(canonical_keys)} canonical "
+                f"keys; first 5 missing: {missing_on_rank0[:5]}",
+                flush=True,
+            )
+        for param_name in canonical_keys:
+            sharded_param = meta_sharded_sd[param_name]
             mesh = sharded_param.device_mesh
+            full_param_src = full_sd_lookup.get(param_name)
+            if full_param_src is None:
+                full_param = torch.zeros(
+                    sharded_param.size(), device="cuda", dtype=sharded_param.dtype
+                )
+            else:
+                full_param = full_param_src.detach().cuda()
+                # Cast to the canonical dtype so the broadcast tensor on rank 0
+                # matches the meta-init dtype on ranks 1-7.
+                if full_param.dtype != sharded_param.dtype:
+                    full_param = full_param.to(dtype=sharded_param.dtype)
             dist.broadcast(full_param, src=0)
             sharded_tensor = distribute_tensor(full_param, mesh, sharded_param.placements)
             to_contiguous, casting_dtype = _infer_parameter_dtype(
@@ -340,7 +382,8 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
             sharded_sd[param_name] = sharded_tensor
     # We need this else to have a matching `broadcast` for all of the ranks, else we deadlock
     else:
-        for param_name, sharded_param in meta_sharded_sd.items():
+        for param_name in canonical_keys:
+            sharded_param = meta_sharded_sd[param_name]
             full_tensor = torch.empty(sharded_param.size(), device="cuda", dtype=sharded_param.dtype)
             mesh = sharded_param.device_mesh
             dist.broadcast(full_tensor, src=0)
