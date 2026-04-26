@@ -134,6 +134,32 @@ class HFModelWrapper(nn.Module):
                 model_config.rope_theta = rope_theta
             model_config._attn_implementation = self.attn_implementation
 
+            # WORKAROUND: gpt_oss ships in MXFP4.  The default load path uses
+            # `Mxfp4GptOssExperts`, which calls non-differentiable triton
+            # `matmul_ogs` kernels — gradients can't flow back through the
+            # MoE forward, so the policy can only learn through attention
+            # LoRA.  Forcing `Mxfp4Config(dequantize=True)` makes
+            # `from_pretrained` use the regular `GptOssExperts` (autograd-
+            # friendly bf16) so gradient flows to the router and expert
+            # biases.
+            extra_quant_config = nf4_config
+            if (
+                getattr(model_config, "model_type", "") == "gpt_oss"
+                and not meta_init
+                and extra_quant_config is None
+            ):
+                try:
+                    from transformers import Mxfp4Config
+
+                    extra_quant_config = Mxfp4Config(dequantize=True)
+                    logger.info(
+                        "[gpt_oss workaround] passing Mxfp4Config(dequantize=True) "
+                        "to from_pretrained so the differentiable GptOssExperts "
+                        "path is used instead of Mxfp4GptOssExperts"
+                    )
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(f"[gpt_oss workaround] Mxfp4Config import failed: {exc}")
+
             if meta_init:
                 with torch.device("meta"):
                     self.model = model_class.from_config(model_config, trust_remote_code=True)
@@ -144,7 +170,7 @@ class HFModelWrapper(nn.Module):
                     config=model_config,
                     trust_remote_code=True,
                     attn_implementation=self.attn_implementation,
-                    quantization_config=nf4_config,
+                    quantization_config=extra_quant_config,
                     torch_dtype=torch.bfloat16 if bf16 else torch.float32,
                     device_map=device_map,
                 )
