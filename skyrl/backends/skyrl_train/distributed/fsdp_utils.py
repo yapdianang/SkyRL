@@ -343,9 +343,21 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
     # dropped during MXFP4 dequant) gets broadcast as zeros.  This keeps
     # the broadcast count identical across all ranks.
     canonical_keys = list(meta_sharded_sd.keys())
+    print(
+        f"[fsdp2_load_full_state_dict] rank={dist.get_rank()} canonical_keys_n="
+        f"{len(canonical_keys)} full_sd_keys_n={len(list(full_sd.keys()))}",
+        flush=True,
+    )
     if dist.get_rank() == 0:
         full_sd_lookup = dict(full_sd)
+        full_only = [k for k in full_sd_lookup if k not in set(canonical_keys)]
         missing_on_rank0 = [k for k in canonical_keys if k not in full_sd_lookup]
+        print(
+            f"[fsdp2_load_full_state_dict] rank=0 keys_only_in_full_sd_n={len(full_only)} "
+            f"first_5_only_in_full_sd={full_only[:5]} keys_only_in_canonical_n="
+            f"{len(missing_on_rank0)} first_5_only_in_canonical={missing_on_rank0[:5]}",
+            flush=True,
+        )
         if missing_on_rank0:
             # Don't crash — log loudly so it's obvious in the engine log,
             # then broadcast zeros so all ranks agree on the collective
