@@ -217,15 +217,26 @@ class HFModelWrapper(nn.Module):
                         if hasattr(self.model, "base_model") and hasattr(self.model.base_model, "model")
                         else self.model
                     )
-                    n_router_params = 0
+                    n_extra = 0
+                    extra_module_types: dict[str, int] = {}
                     for name, mod in base_model.named_modules():
-                        if name.endswith(".mlp.router"):
-                            for pname, param in mod.named_parameters(recurse=False):
-                                param.requires_grad_(True)
-                                n_router_params += param.numel()
+                        # GptOssTopKRouter: gate logits (128, 2880) + bias (128)
+                        # Mxfp4GptOssExperts: gate_up_proj_bias (128, 5760) +
+                        #     down_proj_bias (128, 2880).  The fp4-packed
+                        #     expert weights themselves are non-Parameter
+                        #     buffers so they're not trainable, but the
+                        #     biases are real nn.Parameters.
+                        if name.endswith(".mlp.router") or name.endswith(".mlp.experts"):
+                            for _pname, param in mod.named_parameters(recurse=False):
+                                if not param.requires_grad:
+                                    param.requires_grad_(True)
+                                    n_extra += param.numel()
+                            cls = type(mod).__name__
+                            extra_module_types[cls] = extra_module_types.get(cls, 0) + 1
                     logger.info(
                         f"[gpt_oss workaround] enabled requires_grad on "
-                        f"GptOssTopKRouter weights: total_params={n_router_params}"
+                        f"router + expert biases: total_extra_params={n_extra} "
+                        f"module_types={extra_module_types}"
                     )
 
                 if load_in_4bit:
