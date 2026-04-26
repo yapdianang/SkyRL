@@ -174,18 +174,15 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         use_meta = should_use_meta_init(
             use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
         )
-        # WORKAROUND: gpt-oss ships in MXFP4 and gets dequantized to bf16 by
-        # `transformers.from_pretrained`, which produces a different state_dict
-        # layout than meta-init via `from_config`.  When rank 0 uses
-        # `from_pretrained` and ranks 1-7 use meta-init, the per-rank
-        # state_dict key counts differ (e.g. 831 vs 903 for gpt-oss-120b),
-        # which causes `fsdp2_load_full_state_dict` to issue a different
-        # number of NCCL broadcasts on each rank and `create_model` hangs
-        # forever.  Forcing `use_meta=False` on every rank makes every rank
-        # take the same `from_pretrained` + dequant path, so all ranks land
-        # on the same layout and the broadcasts line up.
-        if getattr(model_config, "model_type", "") == "gpt_oss":
-            use_meta = False
+        # WORKAROUND: gpt-oss ships in MXFP4.  By default `from_pretrained`
+        # builds `Mxfp4GptOssExperts` (uint8-packed weights + non-
+        # differentiable triton kernels), while `from_config` on the meta
+        # device builds the regular `GptOssExperts` (bf16 + autograd-
+        # friendly).  That layout mismatch was the original `create_model`
+        # hang.  We now pass `Mxfp4Config(dequantize=True)` on the
+        # rank-0 `from_pretrained` so it ALSO produces the regular
+        # `GptOssExperts`, matching the meta-init layout on ranks 1-7.
+        # See `model_wrapper.py`.
 
         wrapped_model = HFModelWrapper(
             model_path,
