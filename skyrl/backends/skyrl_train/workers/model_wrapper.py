@@ -187,6 +187,13 @@ class HFModelWrapper(nn.Module):
                     init_lora_weights=True if lora_init_method == "kaiming" else lora_init_method,
                 )
                 self.model = get_peft_model(self.model, lora_config)
+                # Diagnostic: surface trainable LoRA param counts so a
+                # miscount due to target_modules not matching is immediately
+                # visible in the engine log.
+                try:
+                    self.model.print_trainable_parameters()
+                except Exception as exc:  # pragma: no cover
+                    logger.warning(f"[lora] print_trainable_parameters failed: {exc}")
 
                 if load_in_4bit:
                     for name, module in self.model.named_modules():
