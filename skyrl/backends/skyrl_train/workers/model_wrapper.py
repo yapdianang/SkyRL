@@ -195,6 +195,39 @@ class HFModelWrapper(nn.Module):
                 except Exception as exc:  # pragma: no cover
                     logger.warning(f"[lora] print_trainable_parameters failed: {exc}")
 
+                # WORKAROUND for gpt-oss-120b/20b: the experts live inside a
+                # custom `Mxfp4GptOssExperts` module (no nn.Linear), and the
+                # router lives inside a custom `GptOssTopKRouter` module (also
+                # not nn.Linear).  Default LoRA target_modules="all-linear"
+                # therefore only adapts the attention projections and lm_head
+                # (~2.17B / ~120B = ~1.8% of params, ~6M LoRA params), which
+                # leaves the entire MoE routing decision frozen and the model
+                # can't actually learn from RL signal.  Mark the router weight
+                # and bias on every layer as trainable so the policy can move
+                # gate logits directly.  This adds ~36 layers * (128*2880 +
+                # 128) ≈ 13M raw trainable params alongside the LoRA adapters.
+                model_type = (
+                    self.model.config.model_type
+                    if hasattr(self.model, "config") and hasattr(self.model.config, "model_type")
+                    else None
+                )
+                if model_type == "gpt_oss":
+                    base_model = (
+                        self.model.base_model.model
+                        if hasattr(self.model, "base_model") and hasattr(self.model.base_model, "model")
+                        else self.model
+                    )
+                    n_router_params = 0
+                    for name, mod in base_model.named_modules():
+                        if name.endswith(".mlp.router"):
+                            for pname, param in mod.named_parameters(recurse=False):
+                                param.requires_grad_(True)
+                                n_router_params += param.numel()
+                    logger.info(
+                        f"[gpt_oss workaround] enabled requires_grad on "
+                        f"GptOssTopKRouter weights: total_params={n_router_params}"
+                    )
+
                 if load_in_4bit:
                     for name, module in self.model.named_modules():
                         if isinstance(module, LoraLayer):
