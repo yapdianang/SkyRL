@@ -337,18 +337,61 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
     # ~903; NCCL desynchronized and `create_model` hung for the full
     # watchdog timeout (3600s).  See gpt_oss_hang_writeup.md.
     #
-    # The proper long-term fix lives in `fsdp_worker.py`: for these
-    # models, force `use_meta_init=False` on every rank so all ranks load
-    # via `from_pretrained` and end up with identical state_dict layouts.
-    # This loop is left structurally unchanged but logs the key counts so
-    # any future divergence is immediately visible in the engine log.
+    # FAST PATH: when every rank has a real (non-meta) `full_sd` — which is
+    # the case once we force `use_meta_init=False` in `fsdp_worker.py` — we
+    # don't need NCCL broadcasts at all.  Each rank can compute its local
+    # shard from its own copy of the full tensor via `distribute_tensor`,
+    # which is purely local.  This skips O(num_params) NCCL collectives
+    # that otherwise serialize FSDP init for ~60 minutes on gpt-oss-20b /
+    # 120b dequantized.
+    n_meta_keys = len(list(meta_sharded_sd.keys()))
+    n_full_keys = len(list(full_sd.keys()))
+    full_sd_is_materialized = (
+        n_full_keys > 0
+        and all(not p.is_meta for p in full_sd.values())
+    )
     print(
         f"[fsdp2_load_full_state_dict] rank={dist.get_rank()} "
-        f"meta_sharded_sd_keys_n={len(list(meta_sharded_sd.keys()))} "
-        f"full_sd_keys_n={len(list(full_sd.keys()))}",
+        f"meta_sharded_sd_keys_n={n_meta_keys} full_sd_keys_n={n_full_keys} "
+        f"full_sd_is_materialized={full_sd_is_materialized}",
         flush=True,
     )
-    if dist.get_rank() == 0:
+
+    if full_sd_is_materialized:
+        # Skip NCCL broadcasts; iterate by canonical key set (rank-0 keys,
+        # broadcast to all ranks so we agree on the order).
+        rank0_keys: list[str] = list(full_sd.keys()) if dist.get_rank() == 0 else []
+        keys_holder = [rank0_keys]
+        dist.broadcast_object_list(keys_holder, src=0)
+        canonical_keys = keys_holder[0]
+        for param_name in canonical_keys:
+            sharded_param = meta_sharded_sd.get(param_name)
+            if sharded_param is None:
+                # This rank's local sharded model doesn't have the key.
+                # Skip silently; no NCCL needed because we're not doing
+                # any collective in this branch.
+                continue
+            full_param = full_sd.get(param_name)
+            if full_param is None:
+                # Shouldn't happen since every rank has full materialized
+                # state_dict here; fall back to zeros to keep going.
+                full_param = torch.zeros(
+                    sharded_param.size(), device="cuda", dtype=sharded_param.dtype
+                )
+            else:
+                full_param = full_param.detach().cuda()
+                if full_param.dtype != sharded_param.dtype:
+                    full_param = full_param.to(dtype=sharded_param.dtype)
+            mesh = sharded_param.device_mesh
+            sharded_tensor = distribute_tensor(full_param, mesh, sharded_param.placements)
+            to_contiguous, casting_dtype = _infer_parameter_dtype(
+                model,
+                param_name,
+                full_param,
+            )
+            sharded_tensor = _cast_and_contiguous(sharded_tensor, to_contiguous, casting_dtype)
+            sharded_sd[param_name] = sharded_tensor
+    elif dist.get_rank() == 0:
         for (param_name, full_param), sharded_param in zip(full_sd.items(), meta_sharded_sd.values()):
             full_param = full_param.detach().cuda()
             mesh = sharded_param.device_mesh
