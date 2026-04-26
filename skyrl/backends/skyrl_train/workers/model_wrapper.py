@@ -237,33 +237,20 @@ class HFModelWrapper(nn.Module):
                     if hasattr(self.model, "config") and hasattr(self.model.config, "model_type")
                     else None
                 )
-                if model_type == "gpt_oss":
-                    base_model = (
-                        self.model.base_model.model
-                        if hasattr(self.model, "base_model") and hasattr(self.model.base_model, "model")
-                        else self.model
-                    )
-                    n_extra = 0
-                    extra_module_types: dict[str, int] = {}
-                    for name, mod in base_model.named_modules():
-                        # GptOssTopKRouter: gate logits (128, 2880) + bias (128)
-                        # Mxfp4GptOssExperts: gate_up_proj_bias (128, 5760) +
-                        #     down_proj_bias (128, 2880).  The fp4-packed
-                        #     expert weights themselves are non-Parameter
-                        #     buffers so they're not trainable, but the
-                        #     biases are real nn.Parameters.
-                        if name.endswith(".mlp.router") or name.endswith(".mlp.experts"):
-                            for _pname, param in mod.named_parameters(recurse=False):
-                                if not param.requires_grad:
-                                    param.requires_grad_(True)
-                                    n_extra += param.numel()
-                            cls = type(mod).__name__
-                            extra_module_types[cls] = extra_module_types.get(cls, 0) + 1
-                    logger.info(
-                        f"[gpt_oss workaround] enabled requires_grad on "
-                        f"router + expert biases: total_extra_params={n_extra} "
-                        f"module_types={extra_module_types}"
-                    )
+                # NOTE: Earlier we also flipped requires_grad=True on the
+                # GptOssTopKRouter weights and Mxfp4GptOssExperts biases for
+                # gpt_oss.  That dramatically slowed FSDP2 init (19B+
+                # trainable params on a 20B model means the FSDP wrap +
+                # state-dict broadcast scales up by ~3000× vs the 6M LoRA-
+                # only path) and the test never reached forward_backward
+                # within the 1h NCCL watchdog window.  We rely on the
+                # `Mxfp4Config(dequantize=True)` change above to make the
+                # MoE forward path differentiable through autograd, so
+                # gradient still flows back through the expert outputs to
+                # the attention LoRA adapters even though the experts
+                # themselves remain frozen.  If the policy needs to update
+                # routing decisions directly, we can opt these in later
+                # behind a config flag.
 
                 if load_in_4bit:
                     for name, module in self.model.named_modules():
