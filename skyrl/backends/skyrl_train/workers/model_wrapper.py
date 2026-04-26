@@ -204,9 +204,16 @@ class HFModelWrapper(nn.Module):
                 # Skip for granitemoehybrid: its decoder layers don't return router
                 # logits, so enabling this flag causes an IndexError in
                 # load_balancing_loss_func when it tries to access empty gate_logits.
-                if model_config.get("model_type") == "granitemoehybrid":
+                if model_config.get("model_type") in ("granitemoehybrid", "gpt_oss"):
+                    # granitemoehybrid: decoder layers don't return router logits.
+                    # gpt_oss: load_balancing_loss_func IndexErrors with our
+                    # transformers version when output_router_logits is True (the
+                    # forward returns an empty router_logits tuple).  See WORKAROUND
+                    # in fsdp_worker.py.  Skipping is safe — RL fine-tuning here
+                    # doesn't use the router auxiliary loss.
                     logger.info(
-                        "[MoE] granitemoehybrid detected, skipping output_router_logits (decoder layers don't return router logits)"
+                        f"[MoE] {model_config.get('model_type')} detected, skipping "
+                        "output_router_logits"
                     )
                 else:
                     logger.info("[MoE] set output_router_logits as True")
