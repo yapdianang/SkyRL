@@ -213,12 +213,39 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 gradient_checkpointing_kwargs={"use_reentrant": self.cfg.gradient_checkpointing_use_reentrant}
             )
 
+        # DIAGNOSTIC: count trainable params on the wrapped model BEFORE
+        # FSDP wraps it, so we know what the optimizer is going to see.
+        n_trainable_pre = sum(
+            p.numel() for p in wrapped_model.model.parameters() if p.requires_grad
+        )
+        n_total_pre = sum(p.numel() for p in wrapped_model.model.parameters())
+        print(
+            f"[fsdp_worker] pre-FSDP trainable params = {n_trainable_pre} / {n_total_pre} "
+            f"({100.0 * n_trainable_pre / max(n_total_pre, 1):.4f}%)",
+            flush=True,
+        )
         self.model, self.optimizer, self.scheduler = strategy.prepare(
             (wrapped_model, None, None),
         )
         assert (
             self.optimizer is not None and self.scheduler is not None
         ), "FSDP preparation should create optimizer and scheduler"
+        # DIAGNOSTIC: count trainable params after FSDP wrap and the params
+        # actually held by the optimizer.
+        n_trainable_post = sum(
+            p.numel() for p in self.model.model.parameters() if p.requires_grad
+        )
+        n_optim = sum(
+            p.numel()
+            for group in self.optimizer.param_groups
+            for p in group["params"]
+            if p.requires_grad
+        )
+        print(
+            f"[fsdp_worker] post-FSDP trainable params = {n_trainable_post}, "
+            f"optimizer trainable params = {n_optim}",
+            flush=True,
+        )
 
     async def init_weight_sync_state(self, inference_engine_client, inference_engine_cfg: "InferenceEngineConfig"):
         # Call super first to set _transfer_strategy_cls and create sender/receivers
