@@ -167,14 +167,34 @@ class HFModelWrapper(nn.Module):
                     self.model = model_class.from_config(model_config, trust_remote_code=True)
                 self.model.to(torch.bfloat16 if bf16 else torch.float32)
             else:
-                self.model = model_class.from_pretrained(
-                    pretrain_or_model,
+                # WORKAROUND: for gpt_oss with `Mxfp4Config(dequantize=True)`,
+                # the dequantized bf16 model is huge (~234 GB for 120b).  When
+                # 8 ranks per node each call from_pretrained independently,
+                # the node's CPU RAM gets exhausted (8 × 200 GB > 1.7 TB).
+                # `low_cpu_mem_usage=True` makes from_pretrained load weights
+                # tensor-by-tensor onto GPU, freeing CPU buffers as it goes.
+                from_pretrained_kwargs = dict(
+                    pretrain_or_model=pretrain_or_model,
                     config=model_config,
                     trust_remote_code=True,
                     attn_implementation=self.attn_implementation,
                     quantization_config=extra_quant_config,
                     torch_dtype=torch.bfloat16 if bf16 else torch.float32,
                     device_map=device_map,
+                )
+                if (
+                    getattr(model_config, "model_type", "") == "gpt_oss"
+                    and isinstance(extra_quant_config, type(extra_quant_config))
+                    and extra_quant_config is not None
+                ):
+                    from_pretrained_kwargs["low_cpu_mem_usage"] = True
+                # `from_pretrained_kwargs` was authored to avoid duplicating
+                # the call signature; pop the key we use as the positional
+                # arg below.
+                pretrained_path = from_pretrained_kwargs.pop("pretrain_or_model")
+                self.model = model_class.from_pretrained(
+                    pretrained_path,
+                    **from_pretrained_kwargs,
                 )
 
             # gpt oss
