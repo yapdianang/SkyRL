@@ -346,14 +346,22 @@ def fsdp2_load_full_state_dict(model: torch.nn.Module, full_sd: dict, cpu_offloa
     # 120b dequantized.
     n_meta_keys = len(list(meta_sharded_sd.keys()))
     n_full_keys = len(list(full_sd.keys()))
-    full_sd_is_materialized = (
+    rank_full_sd_materialized = int(
         n_full_keys > 0
         and all(not p.is_meta for p in full_sd.values())
     )
+    # All ranks must agree on which path to take or we deadlock — use the
+    # MIN across ranks (1 only if EVERY rank has a materialized full_sd).
+    materialized_tensor = torch.tensor(
+        [rank_full_sd_materialized], device=torch.cuda.current_device(), dtype=torch.int32
+    )
+    dist.all_reduce(materialized_tensor, op=dist.ReduceOp.MIN)
+    full_sd_is_materialized = bool(materialized_tensor.item())
     print(
         f"[fsdp2_load_full_state_dict] rank={dist.get_rank()} "
         f"meta_sharded_sd_keys_n={n_meta_keys} full_sd_keys_n={n_full_keys} "
-        f"full_sd_is_materialized={full_sd_is_materialized}",
+        f"rank_full_sd_materialized={rank_full_sd_materialized} "
+        f"all_ranks_materialized={full_sd_is_materialized}",
         flush=True,
     )
 
