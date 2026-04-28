@@ -15,6 +15,17 @@ class EngineConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     base_model: str = Field(..., description="Base model name (e.g., Qwen/Qwen3-0.6B)")
+    base_model_aliases: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Additional base_model strings the engine accepts on incoming "
+            "/api/v1/sample requests as synonyms for --base-model.  Useful "
+            "when the served checkpoint is a re-saved mirror of an upstream "
+            "HF repo (e.g. unsloth/gpt-oss-120b-BF16) but clients still "
+            "address it by the canonical name (openai/gpt-oss-120b)."
+        ),
+        json_schema_extra={"argparse_type": str, "argparse_action": "append"},
+    )
     backend: str = Field(default="jax", description="Backend to use for training and inference")
     backend_config: dict = Field(
         default_factory=dict,
@@ -94,17 +105,25 @@ def add_model(parser: argparse.ArgumentParser, model: type[BaseModel]) -> None:
             # For boolean flags, use BooleanOptionalAction to support both --{arg_name} and --no-{arg_name}
             kwargs = {**kwargs, "action": argparse.BooleanOptionalAction, "dest": name, "default": default_value}
         else:
-            # Check if explicit argparse_type is specified in field metadata
-            argparse_type = field.json_schema_extra.get("argparse_type") if field.json_schema_extra else None
+            extra = field.json_schema_extra or {}
+            argparse_type = extra.get("argparse_type")
+            argparse_action = extra.get("argparse_action")
             if argparse_type is not None:
                 kwargs["type"] = argparse_type
             elif field.annotation is not None:
                 kwargs["type"] = field.annotation
 
+            if argparse_action == "append":
+                kwargs["action"] = "append"
+                if isinstance(default_value, list):
+                    kwargs["default"] = list(default_value)
+                else:
+                    kwargs["default"] = []
+
             if field.is_required():
                 # Mark as required in argparse if no default is provided
                 kwargs["required"] = True
-            else:
+            elif "default" not in kwargs:
                 # For optional fields, provide the default value to argparse
                 kwargs["default"] = default_value
 
@@ -117,16 +136,19 @@ def config_to_argv(cfg: BaseModel) -> list[str]:
     for field_name, value in cfg.model_dump().items():
         field = cfg.model_fields[field_name]
         arg_name = field_name.replace("_", "-")
+        extra = field.json_schema_extra or {}
 
         if field.annotation is bool:
             argv.append(f"--{arg_name}" if value else f"--no-{arg_name}")
         elif field.annotation is dict:
-            # Serialize dict to JSON string
             if value:
                 argv.append(f"--{arg_name}")
                 argv.append(json.dumps(value))
+        elif extra.get("argparse_action") == "append" and isinstance(value, list):
+            for item in value:
+                argv.append(f"--{arg_name}")
+                argv.append(str(item))
         else:
-            # Skip None values - let them use defaults or environment variables
             if value is not None:
                 argv.append(f"--{arg_name}")
                 argv.append(str(value))

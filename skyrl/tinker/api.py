@@ -1067,8 +1067,10 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
 @app.get("/api/v1/get_server_capabilities", response_model=GetServerCapabilitiesResponse)
 async def get_server_capabilities(request: Request):
     """Retrieve information about supported models and server capabilities."""
+    engine_config = request.app.state.engine_config
     supported_models = [
-        SupportedModel(model_name=request.app.state.engine_config.base_model),
+        SupportedModel(model_name=engine_config.base_model),
+        *(SupportedModel(model_name=name) for name in engine_config.base_model_aliases),
     ]
     return GetServerCapabilitiesResponse(supported_models=supported_models)
 

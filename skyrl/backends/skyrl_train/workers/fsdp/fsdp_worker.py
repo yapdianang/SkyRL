@@ -183,7 +183,16 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         # NCCL watchdog.  Forcing `use_meta=False` so every rank takes the
         # same `from_pretrained` path keeps the layouts identical.
         if getattr(model_config, "model_type", "") == "gpt_oss":
-            use_meta = False
+            src_quant = getattr(model_config, "quantization_config", None)
+            src_quant_method = (
+                getattr(src_quant, "quant_method", None)
+                if src_quant is not None
+                else None
+            )
+            if src_quant_method is None and isinstance(src_quant, dict):
+                src_quant_method = src_quant.get("quant_method")
+            if src_quant_method == "mxfp4":
+                use_meta = False
 
         wrapped_model = HFModelWrapper(
             model_path,

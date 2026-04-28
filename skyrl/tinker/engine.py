@@ -220,8 +220,16 @@ class TinkerEngine:
             if model_id and not self.backend.has_model(model_id):
                 error = f"Model {model_id} not loaded"
             elif not model_id and isinstance(request_data, types.SampleInput):
-                if request_data.base_model != self.config.base_model:
-                    error = f"Engine is configured for '{self.config.base_model}' but request specified '{request_data.base_model}'"
+                allowed_base_models = {
+                    self.config.base_model,
+                    *self.config.base_model_aliases,
+                }
+                if request_data.base_model not in allowed_base_models:
+                    error = (
+                        f"Engine is configured for '{self.config.base_model}' "
+                        f"(aliases={sorted(self.config.base_model_aliases)}) but "
+                        f"request specified '{request_data.base_model}'"
+                    )
                 elif request_data.checkpoint_id:
                     error = "checkpoint_id must be empty for base model sampling"
 

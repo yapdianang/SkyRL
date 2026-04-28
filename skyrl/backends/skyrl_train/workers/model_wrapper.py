@@ -150,17 +150,34 @@ class HFModelWrapper(nn.Module):
                 and not meta_init
                 and extra_quant_config is None
             ):
-                try:
-                    from transformers import Mxfp4Config
+                src_quant = getattr(model_config, "quantization_config", None)
+                src_quant_method = (
+                    getattr(src_quant, "quant_method", None)
+                    if src_quant is not None
+                    else None
+                )
+                if src_quant_method is None and isinstance(src_quant, dict):
+                    src_quant_method = src_quant.get("quant_method")
+                if src_quant_method == "mxfp4":
+                    try:
+                        from transformers import Mxfp4Config
 
-                    extra_quant_config = Mxfp4Config(dequantize=True)
+                        extra_quant_config = Mxfp4Config(dequantize=True)
+                        logger.info(
+                            "[gpt_oss workaround] passing Mxfp4Config(dequantize=True) "
+                            "to from_pretrained so the differentiable GptOssExperts "
+                            "path is used instead of Mxfp4GptOssExperts"
+                        )
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning(
+                            f"[gpt_oss workaround] Mxfp4Config import failed: {exc}"
+                        )
+                else:
                     logger.info(
-                        "[gpt_oss workaround] passing Mxfp4Config(dequantize=True) "
-                        "to from_pretrained so the differentiable GptOssExperts "
-                        "path is used instead of Mxfp4GptOssExperts"
+                        "[gpt_oss workaround] source model has no MXFP4 quantization "
+                        f"(quant_method={src_quant_method!r}); skipping Mxfp4Config "
+                        "(assuming pre-dequantized BF16 mirror, e.g. unsloth/gpt-oss-120b-BF16)"
                     )
-                except Exception as exc:  # pragma: no cover
-                    logger.warning(f"[gpt_oss workaround] Mxfp4Config import failed: {exc}")
 
             if meta_init:
                 with torch.device("meta"):
@@ -182,11 +199,7 @@ class HFModelWrapper(nn.Module):
                     torch_dtype=torch.bfloat16 if bf16 else torch.float32,
                     device_map=device_map,
                 )
-                if (
-                    getattr(model_config, "model_type", "") == "gpt_oss"
-                    and isinstance(extra_quant_config, type(extra_quant_config))
-                    and extra_quant_config is not None
-                ):
+                if getattr(model_config, "model_type", "") == "gpt_oss":
                     from_pretrained_kwargs["low_cpu_mem_usage"] = True
                 # `from_pretrained_kwargs` was authored to avoid duplicating
                 # the call signature; pop the key we use as the positional
