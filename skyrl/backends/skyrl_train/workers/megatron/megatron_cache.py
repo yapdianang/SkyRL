@@ -11,8 +11,10 @@ from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
 from megatron.core import dist_checkpointing
 
 
-def _group_tmp_suffix() -> str:
-    return f".tmp.{os.getpid()}"
+def _dist_world_size() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return 1
 
 
 def _resolve_cache_dir(hf_pretrained: Any) -> Path | None:
@@ -40,7 +42,11 @@ def _resolve_cache_dir(hf_pretrained: Any) -> Path | None:
 
 
 def _checkpoint_exists(path: Path) -> bool:
-    return path.is_dir() and (path / ".cache_complete").is_file()
+    if not path.is_dir() or not (path / ".cache_complete").is_file():
+        return False
+    if not (path / ".metadata").is_file():
+        return False
+    return len(list(path.glob("*.distcp"))) >= _dist_world_size()
 
 
 def _model_sharded_state_dict(megatron_model: Any) -> dict[str, Any]:
@@ -97,10 +103,12 @@ def _install_patch() -> None:
 
         try:
             cache_dir.parent.mkdir(parents=True, exist_ok=True)
-            tmp = cache_dir.with_name(cache_dir.name + _group_tmp_suffix())
+            tmp = cache_dir.with_name(cache_dir.name + ".tmp")
             if rank == 0:
                 if tmp.exists():
                     shutil.rmtree(tmp, ignore_errors=True)
+                if cache_dir.exists() and not _checkpoint_exists(cache_dir):
+                    shutil.rmtree(cache_dir, ignore_errors=True)
                 tmp.mkdir(parents=True, exist_ok=True)
             if dist.is_available() and dist.is_initialized():
                 dist.barrier()
