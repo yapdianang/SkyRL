@@ -1,3 +1,4 @@
+import importlib
 import os
 from collections import defaultdict
 from datetime import timedelta
@@ -60,13 +61,15 @@ from skyrl.train.config.config import MegatronDDPConfig, get_config_as_dict
 from skyrl.train.utils.utils import str_to_torch_dtype, update_model_config
 from skyrl.utils.tok import get_tokenizer
 
+importlib.import_module("skyrl.backends.skyrl_train.workers.megatron.megatron_cache")
+
 if TYPE_CHECKING:
     from skyrl.backends.skyrl_train.inference_engines.base import (
         InferenceEngineInterface,
     )
     from skyrl.train.config.config import InferenceEngineConfig
 
-import skyrl.backends.skyrl_train.workers.megatron.model_bridges as _  # noqa: F401  # register extra bridges
+import skyrl.backends.skyrl_train.workers.megatron.model_bridges as _  # noqa: E402,F401  # register extra bridges
 
 
 class MegatronWeightExtractor(WeightExtractor):
