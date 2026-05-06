@@ -25,6 +25,20 @@ Timeout for initializing the NCCL process group for the worker, defaults to 10 m
 """
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Tinker Checkpoints
+# ─────────────────────────────────────────────────────────────────────────────
+
+SKYRL_TINKER_CHECKPOINT_STAGING_DIR = os.environ.get("SKYRL_TINKER_CHECKPOINT_STAGING_DIR")
+"""
+Optional shared filesystem directory used to stage full training checkpoints
+before the Tinker API archives them.
+
+This should be set for multi-node SkyRL-Train deployments where Ray workers may
+run in different pods than the API process. The default API-local temp directory
+is not visible to remote worker pods.
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Inference Servers
 # ─────────────────────────────────────────────────────────────────────────────
 

@@ -27,7 +27,11 @@ from skyrl.backends.skyrl_train.training_batch import (
 )
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
 from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
-from skyrl.env_vars import _SKYRL_USE_NEW_INFERENCE, SKYRL_RAY_PG_TIMEOUT_IN_S
+from skyrl.env_vars import (
+    _SKYRL_USE_NEW_INFERENCE,
+    SKYRL_RAY_PG_TIMEOUT_IN_S,
+    SKYRL_TINKER_CHECKPOINT_STAGING_DIR,
+)
 from skyrl.tinker import types
 from skyrl.train.config import SkyRLTrainConfig, get_config_as_yaml_str
 from skyrl.train.utils.utils import (
@@ -991,17 +995,36 @@ class SkyRLTrainBackend(AbstractBackend):
         with tarfile.open(output_path, "w") as tar:
             tar.add(source_dir, arcname=".")
 
+    def _create_checkpoint_tempdir(self):
+        """Create a checkpoint staging directory visible to Ray workers when configured."""
+        if SKYRL_TINKER_CHECKPOINT_STAGING_DIR:
+            os.makedirs(SKYRL_TINKER_CHECKPOINT_STAGING_DIR, exist_ok=True)
+            return tempfile.TemporaryDirectory(
+                dir=SKYRL_TINKER_CHECKPOINT_STAGING_DIR,
+                prefix="skyrl_tinker_checkpoint_",
+            )
+        return tempfile.TemporaryDirectory()
+
     def save_checkpoint(self, output_path, model_id: str) -> None:
         """Save full training checkpoint (model + optimizer + scheduler) as tar."""
         self._validate_model_state(model_id)
         role = self._get_role(model_id)
 
-        # Create temp directory for checkpoint
-        with tempfile.TemporaryDirectory() as temp_dir:
+        # Create temp directory for checkpoint. In multi-node deployments this
+        # must be on a shared filesystem so remote Ray workers can materialize
+        # the path that the API process archives.
+        with self._create_checkpoint_tempdir() as temp_dir:
             ckpt_dir = os.path.join(temp_dir, "checkpoint")
 
             # Save checkpoint directory (includes optimizer state automatically)
             self._dispatch.save_checkpoint(model=role, ckpt_dir=ckpt_dir, tokenizer=self._tokenizer)
+
+            if not os.path.isdir(ckpt_dir):
+                staging_hint = (
+                    f" Set SKYRL_TINKER_CHECKPOINT_STAGING_DIR to a shared filesystem path; "
+                    f"current value is {SKYRL_TINKER_CHECKPOINT_STAGING_DIR!r}."
+                )
+                raise FileNotFoundError(f"Checkpoint save did not materialize directory: {ckpt_dir}.{staging_hint}")
 
             # Create tar archive
             self._create_tar_from_directory(ckpt_dir, output_path)
