@@ -1,12 +1,23 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from cloudpathlib import AnyPath
+from fastapi import HTTPException
+from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import Session, SQLModel
+from sqlmodel.ext.asyncio.session import AsyncSession
 
-from skyrl.tinker import types
+from skyrl.tinker import api, types
 from skyrl.tinker.config import EngineConfig
-from skyrl.tinker.db_models import FutureDB, ModelDB, RequestStatus, SessionDB
+from skyrl.tinker.db_models import (
+    CheckpointDB,
+    CheckpointStatus,
+    FutureDB,
+    ModelDB,
+    RequestStatus,
+    SessionDB,
+)
 from skyrl.tinker.engine import TinkerEngine, prepare_model_pass_batch
 
 BASE_MODEL = "trl-internal-testing/tiny-Qwen3ForCausalLM"
@@ -255,3 +266,113 @@ def test_find_single_requests_barrier_is_per_model(scheduling_engine):
         assert list(singles.keys()) == ["2", "5"]
         assert singles["2"][0] == "model_a"
         assert singles["5"][0] == "model_b"
+
+
+async def _make_async_session_engine():
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(SQLModel.metadata.create_all)
+    return engine
+
+
+async def _seed_model(session: AsyncSession, model_id: str = "model_1") -> None:
+    session.add(SessionDB(session_id="session_1", sdk_version="test"))
+    session.add(
+        ModelDB(
+            model_id=model_id,
+            base_model=BASE_MODEL,
+            lora_config=types.LoraConfig(rank=8, alpha=16, seed=0).model_dump(),
+            status="ready",
+            request_id=1,
+            session_id="session_1",
+        )
+    )
+    await session.commit()
+
+
+def test_create_checkpoint_resets_failed_row():
+    """A failed checkpoint row is retried instead of permanently returning 409."""
+
+    async def _run():
+        engine = await _make_async_session_engine()
+        async with AsyncSession(engine) as session:
+            await _seed_model(session)
+            session.add(
+                CheckpointDB(
+                    model_id="model_1",
+                    checkpoint_id="global_step_0",
+                    checkpoint_type=types.CheckpointType.TRAINING,
+                    status=CheckpointStatus.FAILED,
+                    error_message="checkpoint write failed",
+                    completed_at=datetime.now(timezone.utc),
+                )
+            )
+            await session.commit()
+
+            await api.create_checkpoint(
+                session=session,
+                model_id="model_1",
+                checkpoint_id="global_step_0",
+                checkpoint_type=types.CheckpointType.TRAINING,
+            )
+            await session.commit()
+
+            checkpoint = await session.get(
+                CheckpointDB,
+                ("model_1", "global_step_0", types.CheckpointType.TRAINING),
+            )
+            assert checkpoint is not None
+            assert checkpoint.status == CheckpointStatus.PENDING
+            assert checkpoint.error_message is None
+            assert checkpoint.completed_at is None
+
+    asyncio.run(_run())
+
+
+@pytest.mark.parametrize("status", [CheckpointStatus.PENDING, CheckpointStatus.COMPLETED])
+def test_create_checkpoint_existing_active_or_completed_row_returns_409(status: CheckpointStatus):
+    """Pending and completed checkpoint rows are not clobbered by retries."""
+
+    async def _run():
+        engine = await _make_async_session_engine()
+        async with AsyncSession(engine) as session:
+            await _seed_model(session)
+            session.add(
+                CheckpointDB(
+                    model_id="model_1",
+                    checkpoint_id="global_step_0",
+                    checkpoint_type=types.CheckpointType.TRAINING,
+                    status=status,
+                    completed_at=datetime.now(timezone.utc) if status == CheckpointStatus.COMPLETED else None,
+                )
+            )
+            await session.commit()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await api.create_checkpoint(
+                    session=session,
+                    model_id="model_1",
+                    checkpoint_id="global_step_0",
+                    checkpoint_type=types.CheckpointType.TRAINING,
+                )
+            assert exc_info.value.status_code == 409
+
+    asyncio.run(_run())
+
+
+def test_create_checkpoint_missing_model_returns_404():
+    """Missing model IDs still report 404 instead of checkpoint conflict."""
+
+    async def _run():
+        engine = await _make_async_session_engine()
+        async with AsyncSession(engine) as session:
+            with pytest.raises(HTTPException) as exc_info:
+                await api.create_checkpoint(
+                    session=session,
+                    model_id="missing_model",
+                    checkpoint_id="global_step_0",
+                    checkpoint_type=types.CheckpointType.TRAINING,
+                )
+            assert exc_info.value.status_code == 404
+
+    asyncio.run(_run())

@@ -214,7 +214,32 @@ async def create_checkpoint(
     checkpoint_id: str,
     checkpoint_type: types.CheckpointType,
 ):
-    """Create a pending CheckpointDB entry, relying on database constraints for validation."""
+    """Create a pending checkpoint row, allowing retries of failed writes.
+
+    The checkpoint row is created before the checkpoint files are materialized.
+    If materialization fails, the engine marks the row FAILED. Retrying the same
+    checkpoint ID should reuse that failed row; otherwise one transient file I/O
+    error permanently poisons the checkpoint name with a 409.
+    """
+    if not await session.get(ModelDB, model_id):
+        raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
+
+    existing_checkpoint = await session.get(
+        CheckpointDB, (model_id, checkpoint_id, checkpoint_type)
+    )
+    if existing_checkpoint is not None:
+        if existing_checkpoint.status == CheckpointStatus.FAILED:
+            existing_checkpoint.status = CheckpointStatus.PENDING
+            existing_checkpoint.error_message = None
+            existing_checkpoint.completed_at = None
+            existing_checkpoint.created_at = datetime.now(timezone.utc)
+            await session.flush()
+            return
+        raise HTTPException(
+            status_code=409,
+            detail=f"Checkpoint '{checkpoint_id}' already exists for model '{model_id}'",
+        )
+
     checkpoint_db = CheckpointDB(
         model_id=model_id,
         checkpoint_id=checkpoint_id,
@@ -227,16 +252,28 @@ async def create_checkpoint(
         await session.flush()
     except IntegrityError:
         await session.rollback()
-        # Determine which constraint failed by checking if the model exists
-        statement = select(ModelDB).where(ModelDB.model_id == model_id)
-        result = await session.exec(statement)
-
-        if not result.first():
+        if not await session.get(ModelDB, model_id):
             raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found")
-        else:
-            raise HTTPException(
-                status_code=409, detail=f"Checkpoint '{checkpoint_id}' already exists for model '{model_id}'"
-            )
+
+        # Another request may have inserted the same checkpoint row after our
+        # initial read. Preserve the same retry semantics for FAILED rows.
+        existing_checkpoint = await session.get(
+            CheckpointDB, (model_id, checkpoint_id, checkpoint_type)
+        )
+        if (
+            existing_checkpoint is not None
+            and existing_checkpoint.status == CheckpointStatus.FAILED
+        ):
+            existing_checkpoint.status = CheckpointStatus.PENDING
+            existing_checkpoint.error_message = None
+            existing_checkpoint.completed_at = None
+            existing_checkpoint.created_at = datetime.now(timezone.utc)
+            await session.flush()
+            return
+        raise HTTPException(
+            status_code=409,
+            detail=f"Checkpoint '{checkpoint_id}' already exists for model '{model_id}'",
+        )
 
 
 class LoRAConfig(BaseModel):

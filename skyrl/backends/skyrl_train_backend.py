@@ -991,6 +991,34 @@ class SkyRLTrainBackend(AbstractBackend):
         with tarfile.open(output_path, "w") as tar:
             tar.add(source_dir, arcname=".")
 
+    def _log_checkpoint_tree(self, label: str, root: str, max_depth: int = 2) -> None:
+        """Log a bounded checkpoint directory tree for save_weights diagnosis."""
+        root_abs = os.path.abspath(root)
+        if not os.path.isdir(root_abs):
+            logger.info("[ckpt-diag] %s root=%s not_a_dir", label, root_abs)
+            return
+
+        depth_root = root_abs.count(os.sep)
+        entries: list[tuple[str, int]] = []
+        for dirpath, dirnames, filenames in os.walk(root_abs):
+            depth = dirpath.count(os.sep) - depth_root
+            if depth > max_depth:
+                dirnames[:] = []
+                continue
+            for filename in filenames:
+                path = os.path.join(dirpath, filename)
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    size = -1
+                entries.append((path, size))
+
+        logger.info("[ckpt-diag] %s root=%s files=%d", label, root_abs, len(entries))
+        for path, size in entries[:50]:
+            logger.info("[ckpt-diag] %s size=%d", path, size)
+        if len(entries) > 50:
+            logger.info("[ckpt-diag] %s truncated_files=%d", label, len(entries) - 50)
+
     def save_checkpoint(self, output_path, model_id: str) -> None:
         """Save full training checkpoint (model + optimizer + scheduler) as tar."""
         self._validate_model_state(model_id)
@@ -999,12 +1027,31 @@ class SkyRLTrainBackend(AbstractBackend):
         # Create temp directory for checkpoint
         with tempfile.TemporaryDirectory() as temp_dir:
             ckpt_dir = os.path.join(temp_dir, "checkpoint")
+            logger.info(
+                "[ckpt-diag] save_checkpoint start model_id=%s output_path=%s temp_dir=%s ckpt_dir=%s",
+                model_id,
+                output_path,
+                temp_dir,
+                ckpt_dir,
+            )
+            self._log_checkpoint_tree("pre-dispatch", temp_dir)
 
             # Save checkpoint directory (includes optimizer state automatically)
             self._dispatch.save_checkpoint(model=role, ckpt_dir=ckpt_dir, tokenizer=self._tokenizer)
 
+            logger.info(
+                "[ckpt-diag] save_checkpoint post-dispatch ckpt_dir=%s exists=%s is_dir=%s",
+                ckpt_dir,
+                os.path.exists(ckpt_dir),
+                os.path.isdir(ckpt_dir),
+            )
+            self._log_checkpoint_tree("post-dispatch", temp_dir)
+            if not os.path.isdir(ckpt_dir):
+                raise FileNotFoundError(f"Checkpoint directory missing after dispatch: {ckpt_dir}")
+
             # Create tar archive
             self._create_tar_from_directory(ckpt_dir, output_path)
+            logger.info("[ckpt-diag] save_checkpoint tar-created output_path=%s", output_path)
 
         logger.info(f"Saved checkpoint for {model_id} to {output_path}")
 
