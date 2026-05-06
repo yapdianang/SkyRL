@@ -279,10 +279,7 @@ def build_new_inference_client(
             placement_group=placement_group,
         )
 
-    lora_cfg = cfg.trainer.policy.model.lora
-    active_lora_name = (
-        _SKYRL_LORA_ADAPTER_NAME if lora_cfg and lora_cfg.rank > 0 and cfg.trainer.strategy != "megatron" else None
-    )
+    active_lora_name = _SKYRL_LORA_ADAPTER_NAME if _uses_lora_weight_sync(cfg) else None
     client = RemoteInferenceClient(
         proxy_url=server_setup.proxy_url,
         server_urls=server_setup.server_urls,
