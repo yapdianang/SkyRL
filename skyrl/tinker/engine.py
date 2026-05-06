@@ -327,6 +327,31 @@ class TinkerEngine:
         )
         return dict(session.exec(query).all())
 
+    def _find_sampling_barriers(self, session: Session) -> dict[str, int]:
+        """Find the earliest pending operation that must run before newer samples."""
+        query = (
+            select(FutureDB.model_id, func.min(FutureDB.request_id).label("barrier_id"))
+            .where(
+                (FutureDB.request_type == types.RequestType.SAVE_WEIGHTS_FOR_SAMPLER)
+                | (FutureDB.request_type == types.RequestType.LOAD_WEIGHTS)
+                | (FutureDB.request_type == types.RequestType.UNLOAD_MODEL)
+            )
+            .where(FutureDB.status == RequestStatus.PENDING)
+            .group_by(FutureDB.model_id)
+        )
+        return dict(session.exec(query).all())
+
+    def _sample_batch_limit(self) -> int:
+        """Return a conservative sample batch cap matching serving capacity when available."""
+        if self.config.backend == "jax" and self.backend.config.sample_max_num_sequences > 0:
+            return self.backend.config.sample_max_num_sequences
+
+        cfg = getattr(self.backend, "_cfg", None)
+        generator = getattr(cfg, "generator", None)
+        inference_engine = getattr(generator, "inference_engine", None)
+        max_num_seqs = getattr(inference_engine, "max_num_seqs", 0)
+        return int(max_num_seqs or 0)
+
     def find_batchable_model_passes(
         self, session: Session, request_type: types.RequestType
     ) -> dict[str, tuple[str, types.ForwardBackwardInput]]:
@@ -408,20 +433,32 @@ class TinkerEngine:
             .order_by(FutureDB.request_id)
         )
         sample_ops = session.exec(sample_query).all()
+        barriers = self._find_sampling_barriers(session)
 
         batchable = []
         model_checkpoints = {}  # Map from model_id to checkpoint_id of first request to that model
         for op in sample_ops:
+            barrier_id = barriers.get(op.model_id)
+            if barrier_id is not None and op.request_id >= barrier_id:
+                continue
             checkpoint_id = op.request_data["checkpoint_id"]
             # Base model requests (empty checkpoint_id) are always compatible, otherwise only
             # take only requests with one checkpoint_id for a given model_id
             if checkpoint_id == "" or model_checkpoints.setdefault(op.model_id, checkpoint_id) == checkpoint_id:
                 batchable.append(op)
 
-        # TODO: This leaks the abstraction by accessing backend-specific config.
-        # We should find a better way to handle this going forward.
-        if self.config.backend == "jax" and self.backend.config.sample_max_num_sequences > 0:
-            batchable = batchable[: self.backend.config.sample_max_num_sequences]
+        if len(batchable) < len(sample_ops):
+            logger.info(
+                "find_batchable_sample: batchable=%d pending_sample=%d models_with_barriers=%d",
+                len(batchable),
+                len(sample_ops),
+                len(barriers),
+            )
+
+        sample_limit = self._sample_batch_limit()
+        if sample_limit > 0 and len(batchable) > sample_limit:
+            logger.info("find_batchable_sample: limiting sample batch %d -> %d", len(batchable), sample_limit)
+            batchable = batchable[:sample_limit]
 
         return {str(f.request_id): (f.model_id, types.SampleInput.model_validate(f.request_data)) for f in batchable}
 

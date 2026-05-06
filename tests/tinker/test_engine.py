@@ -1,5 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from cloudpathlib import AnyPath
@@ -266,6 +267,79 @@ def test_find_single_requests_barrier_is_per_model(scheduling_engine):
         assert list(singles.keys()) == ["2", "5"]
         assert singles["2"][0] == "model_a"
         assert singles["5"][0] == "model_b"
+
+
+def _sample_request(checkpoint_id: str = "ckpt") -> dict:
+    return types.SampleInput(
+        prompt=types.ModelInput(chunks=[types.EncodedTextChunk(tokens=[1, 2, 3])]),
+        sampling_params=types.SamplingParams(temperature=1.0, max_tokens=16, seed=0),
+        num_samples=1,
+        checkpoint_id=checkpoint_id,
+        prompt_logprobs=False,
+    ).model_dump()
+
+
+def test_find_batchable_sample_respects_sampler_weight_sync_barrier(scheduling_engine):
+    """Samples queued after a sampler-weight sync must wait for the sync to run first."""
+    engine = scheduling_engine
+    engine.config = EngineConfig(base_model=BASE_MODEL, backend="megatron")
+    engine.backend = SimpleNamespace(
+        _cfg=SimpleNamespace(
+            generator=SimpleNamespace(inference_engine=SimpleNamespace(max_num_seqs=64)),
+        )
+    )
+
+    with Session(engine.db_engine) as session:
+        for req_type, request_data in [
+            (types.RequestType.SAMPLE, _sample_request()),
+            (types.RequestType.SAMPLE, _sample_request()),
+            (
+                types.RequestType.SAVE_WEIGHTS_FOR_SAMPLER,
+                types.SaveWeightsForSamplerInput(path="ss1_seq1", sampling_session_seq_id=1, seq_id=1).model_dump(),
+            ),
+            (types.RequestType.SAMPLE, _sample_request()),
+            (types.RequestType.SAMPLE, _sample_request()),
+        ]:
+            session.add(
+                FutureDB(
+                    request_type=req_type,
+                    model_id="model_a",
+                    request_data=request_data,
+                    status=RequestStatus.PENDING,
+                )
+            )
+        session.commit()
+
+    with Session(engine.db_engine) as session:
+        samples = engine.find_batchable_sample(session)
+        assert list(samples.keys()) == ["1", "2"]
+
+
+def test_find_batchable_sample_caps_batch_to_serving_capacity(scheduling_engine):
+    """Megatron/vLLM sample batches are capped by generator.inference_engine.max_num_seqs."""
+    engine = scheduling_engine
+    engine.config = EngineConfig(base_model=BASE_MODEL, backend="megatron")
+    engine.backend = SimpleNamespace(
+        _cfg=SimpleNamespace(
+            generator=SimpleNamespace(inference_engine=SimpleNamespace(max_num_seqs=2)),
+        )
+    )
+
+    with Session(engine.db_engine) as session:
+        for _ in range(4):
+            session.add(
+                FutureDB(
+                    request_type=types.RequestType.SAMPLE,
+                    model_id="model_a",
+                    request_data=_sample_request(),
+                    status=RequestStatus.PENDING,
+                )
+            )
+        session.commit()
+
+    with Session(engine.db_engine) as session:
+        samples = engine.find_batchable_sample(session)
+        assert list(samples.keys()) == ["1", "2"]
 
 
 async def _make_async_session_engine():
