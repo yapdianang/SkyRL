@@ -961,6 +961,8 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         The batch is split into micro batches based on micro_train_batch_size_per_gpu,
         or by token count if max_tokens_per_microbatch is configured.
         Megatron Core's forward_backward_func handles gradient accumulation internally.
+        Gradients also accumulate across calls until :meth:`optim_step`; Tinker can
+        split one logical batch into multiple forward_backward requests.
 
         Args:
             data: TrainingInputBatch (already DP-sharded by WorkerDispatch/MeshDispatch)
@@ -975,9 +977,6 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         from skyrl.backends.skyrl_train.utils.replay_utils import clear_router_replay
 
         self.model.train()
-        for chunk in self.actor_module:
-            # if use distributed optimizer, zero grad buffer will be handled by optimizer
-            chunk.zero_grad_buffer()
 
         all_metrics = defaultdict(list)
 
