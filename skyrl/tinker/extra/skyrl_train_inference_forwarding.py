@@ -11,7 +11,10 @@ import httpx
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from skyrl.backends.renderer import render_model_input
-from skyrl.backends.utils import convert_vllm_prompt_logprobs
+from skyrl.backends.utils import (
+    convert_vllm_decode_logprobs,
+    convert_vllm_prompt_logprobs,
+)
 from skyrl.tinker import types
 from skyrl.tinker.config import EngineConfig
 from skyrl.tinker.db_models import EngineStateDB, FutureDB, RequestStatus
@@ -154,6 +157,10 @@ class SkyRLTrainInferenceForwardingClient:
             "stream": False,
             "return_token_ids": True,
         }
+        decode_topk = getattr(sample_req, "topk_logprobs", 0) or 0
+        if decode_topk:
+            payload["logprobs"] = decode_topk
+            payload["return_tokens_as_token_ids"] = True
         # vLLM's `prompt_logprobs` is an int: 0 returns just the prompt tokens'
         # own logprobs, k>0 also returns the top-k per position.
         topk_prompt_logprobs = getattr(sample_req, "topk_prompt_logprobs", 0) or 0
@@ -203,6 +210,7 @@ class SkyRLTrainInferenceForwardingClient:
             tokens = choice.get("token_ids", [])
             lp = choice.get("logprobs") or {}
             logprobs = lp.get("token_logprobs") or []
+            decode_logprobs = convert_vllm_decode_logprobs(tokens, logprobs, lp.get("top_logprobs"), decode_topk)
             # vLLM occasionally returns None for logprobs under load; zero-fill so
             # RL advantage computation doesn't see a ragged shape.
             if not logprobs and tokens:
@@ -215,6 +223,7 @@ class SkyRLTrainInferenceForwardingClient:
                 types.GeneratedSequence(
                     tokens=tokens,
                     logprobs=logprobs,
+                    topk_logprobs=decode_logprobs,
                     stop_reason=stop_reason,
                 )
             )

@@ -166,7 +166,7 @@ class BaseBatchIterator:
             router_padding_mask=batch.get("router_padding_mask"),
             # additional info
             # can be used to log metrics etc for micro-batches in the worker
-            info={},
+            info={key: batch[key] for key in ("topk_token_ids", "topk_logprobs", "reference_logprobs") if key in batch},
             # propagate metadata as is
             metadata=batch.metadata,
             # Multi-modal vision fields (may be absent for text-only)
@@ -321,6 +321,9 @@ class TokenBasedBatchIterator(BaseBatchIterator):
                 "response_mask": torch.ones((batch_size, num_actions), dtype=int, device=device),
             }
         )
+        for key in ("topk_token_ids", "topk_logprobs", "reference_logprobs"):
+            if key in self.data:
+                data[key] = torch.zeros_like(self.data[key][:1])
         # Add optional fields such as `rollout_logprobs` and `rollout_expert_indices` to padding batch
         if self.data.get("rollout_logprobs") is not None:
             ref_tensor = self.data["rollout_logprobs"]

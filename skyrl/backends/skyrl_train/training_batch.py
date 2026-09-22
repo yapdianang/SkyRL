@@ -476,6 +476,9 @@ class TrainingInput(TypedDict, total=False):
     loss_mask: Float[torch.Tensor, "batch_size response_len"]  # 1 = trainable; 0 masks e.g. tool output
     response_mask: Integer[torch.Tensor, "batch_size response_len"]  # 1 = response (not prompt) token
     action_log_probs: Float[torch.Tensor, "batch_size response_len"]  # current policy, from the training forward
+    topk_token_ids: Optional[Integer[torch.Tensor, "batch_size response_len k"]]
+    topk_logprobs: Optional[Float[torch.Tensor, "batch_size response_len k"]]
+    reference_logprobs: Optional[Float[torch.Tensor, "batch_size response_len"]]
     base_action_log_probs: Float[torch.Tensor, "batch_size response_len"]  # reference policy, for the KL term
     values: Optional[Float[torch.Tensor, "batch_size response_len"]]  # critic estimates; None without a critic
     returns: Float[torch.Tensor, "batch_size response_len"]  # critic regression target

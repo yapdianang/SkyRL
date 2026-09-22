@@ -206,6 +206,9 @@ class SkyRLTrainBackend(AbstractBackend):
             "all_token_weights",
             "all_sampling_logprobs",
             "all_advantages",
+            "all_topk_token_ids",
+            "all_topk_logprobs",
+            "all_reference_logprobs",
             "all_values",
             "all_returns",
             "all_model_ids",
@@ -214,7 +217,12 @@ class SkyRLTrainBackend(AbstractBackend):
         )
 
         request_slices_by_model_id: dict[str, list[tuple[str, str, int, int]]] = {}
-        for request_id, model_id, start_idx, end_idx in prepared_batch.request_batch_slices:
+        for (
+            request_id,
+            model_id,
+            start_idx,
+            end_idx,
+        ) in prepared_batch.request_batch_slices:
             # Validate early so an unknown model_id still surfaces clearly.
             self._get_role(model_id)
             request_slices_by_model_id.setdefault(model_id, []).append((request_id, model_id, start_idx, end_idx))
@@ -712,7 +720,9 @@ class SkyRLTrainBackend(AbstractBackend):
             if has_values and any(
                 len(values) != len(weights) or len(returns) != len(weights)
                 for values, returns, weights in zip(
-                    prepared_batch.all_values, prepared_batch.all_returns, prepared_batch.all_token_weights
+                    prepared_batch.all_values,
+                    prepared_batch.all_returns,
+                    prepared_batch.all_token_weights,
                 )
             ):
                 raise ValueError("Critic batches with values/returns must align with response-token lengths")
@@ -735,6 +745,15 @@ class SkyRLTrainBackend(AbstractBackend):
             if ref is not None:
                 placeholder = torch.empty(0, *ref.shape[1:], dtype=ref.dtype, device=ref.device)
                 batch_dict[mm_key] = TensorList([v if v is not None else placeholder for v in values])
+
+        if {"ppo_score_centered", "reinforce_score_centered"}.intersection(prepared_batch.all_loss_fns):
+            from skyrl.backends.skyrl_train.score_centering import (
+                add_score_centering_inputs,
+            )
+
+            if self._cfg.trainer.strategy != "megatron":
+                raise ValueError("ppo_score_centered requires the Megatron fused LM-head backend")
+            add_score_centering_inputs(batch_dict, prepared_batch, max_response_len)
 
         batch = TrainingInputBatch(batch_dict)
         batch.metadata = {"response_length": max_response_len}
@@ -894,7 +913,9 @@ class SkyRLTrainBackend(AbstractBackend):
         if role == "critic" and any(
             len(values) != len(weights) or len(returns) != len(weights)
             for values, returns, weights in zip(
-                prepared_batch.all_values, prepared_batch.all_returns, prepared_batch.all_token_weights
+                prepared_batch.all_values,
+                prepared_batch.all_returns,
+                prepared_batch.all_token_weights,
             )
         ):
             raise ValueError("Critic forward_backward requires values and returns for every response token")
@@ -1062,7 +1083,8 @@ class SkyRLTrainBackend(AbstractBackend):
         unknown = [mid for mid in unique_models if mid not in self._model_ids_to_role]
         if unknown:
             error = types.ErrorResponse(
-                error=f"Sampling requested for unknown model_id(s): {sorted(unknown)}", status="error"
+                error=f"Sampling requested for unknown model_id(s): {sorted(unknown)}",
+                status="error",
             )
             return {req_id: error for req_id, *_ in prepared_batch.request_batch_slices}
         non_policy = [mid for mid in unique_models if self._model_ids_to_role.get(mid) != "policy"]
@@ -1098,7 +1120,14 @@ class SkyRLTrainBackend(AbstractBackend):
         # _aggregate_sample_results reads them back from.
         num_samples_total = len(prepared_batch.all_model_inputs)
         prompt_logprobs_at: dict[int, int] = {}
-        for _, _, start_idx, _, prompt_logprobs_requested, topk in prepared_batch.request_batch_slices:
+        for (
+            _,
+            _,
+            start_idx,
+            _,
+            prompt_logprobs_requested,
+            topk,
+        ) in prepared_batch.request_batch_slices:
             if prompt_logprobs_requested and start_idx < num_samples_total:
                 prompt_logprobs_at[start_idx] = topk
 
@@ -1264,7 +1293,12 @@ class SkyRLTrainBackend(AbstractBackend):
             ckpt_dir = os.path.join(temp_dir, "checkpoint")
 
             # Save checkpoint directory (includes optimizer state automatically)
-            self._dispatch.save_checkpoint(model=role, ckpt_dir=ckpt_dir, tokenizer=self._tokenizer, model_id=model_id)
+            self._dispatch.save_checkpoint(
+                model=role,
+                ckpt_dir=ckpt_dir,
+                tokenizer=self._tokenizer,
+                model_id=model_id,
+            )
 
             # Drain any in-flight async write so the tar can't capture a partial checkpoint.
             self._dispatch.finalize_pending_saves(role)
