@@ -93,6 +93,9 @@ class MegatronWeightSource(WeightSource):
 
     There is no shape-only export, so ``metadata()`` runs a dry export and
     caches. Engines call it every round; the cost is one-time.
+
+    fp32 tensors, such as the MoE router ``e_score_correction_bias``, stay fp32;
+    everything else is cast to ``dtype``.
     """
 
     def __init__(self, bridge: Any, module: Any, dtype: torch.dtype) -> None:
@@ -104,11 +107,14 @@ class MegatronWeightSource(WeightSource):
     def _export(self) -> Iterator[Tuple[str, torch.Tensor]]:
         return self._bridge.export_hf_weights(self._module, show_progress=False, conversion_tasks=None)
 
+    def _sync_dtype(self, tensor: torch.Tensor) -> torch.dtype:
+        return torch.float32 if tensor.dtype == torch.float32 else self._dtype
+
     def metadata(self) -> List[ParamMeta]:
         if self._meta is None:
             meta: List[ParamMeta] = []
             for name, tensor in self._export():
-                meta.append(ParamMeta(name, self._dtype, tuple(tensor.shape)))
+                meta.append(ParamMeta(name, self._sync_dtype(tensor), tuple(tensor.shape)))
                 del tensor
             self._meta = meta
         return self._meta
@@ -117,7 +123,7 @@ class MegatronWeightSource(WeightSource):
         # See FsdpWeightSource.__iter__ on the device.
         device = torch.cuda.current_device() if torch.cuda.is_available() else None
         for name, tensor in self._export():
-            full = tensor.to(device=device, dtype=self._dtype, non_blocking=True).detach().contiguous()
+            full = tensor.to(device=device, dtype=self._sync_dtype(tensor), non_blocking=True).detach().contiguous()
             yield name, full
 
 

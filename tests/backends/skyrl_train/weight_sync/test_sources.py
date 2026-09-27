@@ -177,3 +177,16 @@ class TestMegatronWeightSource:
         bridge = _FakeBridge(self._tensors(), expect_module=module)
         list(MegatronWeightSource(bridge, module, torch.bfloat16))
         assert bridge.export_calls == 1
+
+    def test_keeps_fp32_tensors_fp32(self):
+        """The fp32 MoE router bias differs by less than one bf16 step within a layer."""
+        bias = torch.tensor([34.0625, 34.1875, 46.9375], dtype=torch.float32)
+        bridge = _FakeBridge(
+            [
+                ("model.layers.0.mixer.gate.weight", torch.ones(3, 2, dtype=torch.float16)),
+                ("model.layers.0.mixer.gate.e_score_correction_bias", bias),
+            ]
+        )
+        meta, pairs = _assert_channels_agree(MegatronWeightSource(bridge, object(), torch.bfloat16))
+        assert [m.dtype for m in meta] == [torch.bfloat16, torch.float32]
+        torch.testing.assert_close(pairs[1][1], bias, rtol=0, atol=0)
