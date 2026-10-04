@@ -97,16 +97,11 @@ Byte cap of the recorded decode heads; the least recently used entries are evict
 SKYRL_STABILIZED_COMPARISONS = int(os.environ.get("SKYRL_STABILIZED_COMPARISONS") or 0)
 """
 K comparison tokens drawn i.i.d. per generated token from the processed sampling distribution.
-vLLM engines return their histogram in place of decode top-k logprobs (this requires
-``logprobs_mode=processed_logprobs``), and the API server records it as K-wide decode heads.
-Set it on every node that runs vLLM engines and on the API server, with
-``SKYRL_SCORE_CENTERING_RECORD_TOPK`` equal to K. Default 0 disables.
-"""
-
-SKYRL_STABILIZED_LEAVE_IN = str(os.environ.get("SKYRL_STABILIZED_LEAVE_IN", "False")).lower() in ("true", "1", "yes")
-"""
-With ``SKYRL_STABILIZED_COMPARISONS=K``, vLLM draws K - 1 comparisons and counts the sampled token
-as the K-th. Set it on every node that runs vLLM engines. Default: False.
+vLLM engines return them after the decode top-k logprobs (this requires
+``logprobs_mode=processed_logprobs``), and the API server records their histogram as K-wide decode
+heads next to the top-k heads of ``SKYRL_SCORE_CENTERING_RECORD_TOPK``. A forward_backward request
+selects them with ``score_centering_comparisons=K``. Set it on every node that runs vLLM engines and
+on the API server. Default 0 disables.
 """
 
 # ─────────────────────────────────────────────────────────────────────────────

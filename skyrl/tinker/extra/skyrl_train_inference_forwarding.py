@@ -250,7 +250,7 @@ class SkyRLTrainInferenceForwardingClient:
             decode_logprobs = convert_vllm_decode_logprobs(tokens, logprobs, lp.get("top_logprobs"), decode_topk)
             if record_topk:
                 self.decode_heads.record(
-                    sampling_model(model_id, base_model), prompt_tokens, tokens, logprobs, lp.get("top_logprobs")
+                    sampling_model(model_id, base_model), prompt_tokens, tokens, logprobs, lp.get("top_logprobs"), sp
                 )
             # vLLM occasionally returns None for logprobs under load; zero-fill so
             # RL advantage computation doesn't see a ragged shape.

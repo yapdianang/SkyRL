@@ -1,7 +1,7 @@
 """Ratio-free score-centered REINFORCE on recorded comparison histograms is the stabilized_reinforce candidate.
 
 Candidate at kl_coeff=0: loss = -A (z_a - sum_v f_v z_v), f the histogram of K draws from the sampler's law.
-Heads go through the vLLM column encoding, vLLM's per-position dict and the API server's decoding.
+Heads go through the vLLM carrier columns, vLLM's per-position dict and the API server's decoding.
 """
 
 import itertools
@@ -12,32 +12,39 @@ import pytest
 import torch
 
 from skyrl.backends.skyrl_train.patches.vllm.patch_stabilized_comparisons import (
-    encode_comparisons,
+    carrier_columns,
 )
 from skyrl.backends.skyrl_train.score_centering import score_centered_reinforce_loss
-from skyrl.backends.utils import COMPARISON_PAD_LOGPROB, convert_vllm_comparison_heads
+from skyrl.backends.utils import (
+    COMPARISON_PAD_LOGPROB,
+    convert_comparison_heads,
+    split_comparison_carriers,
+)
+from skyrl.tinker.decode_heads import hash_tokens, subsampled_comparison_heads
 
 K = 16
 # Padding needs K distinct ids, so the learner vocabulary is larger than the sampler's support.
 VOCAB = 20
 
 
-def recorded_heads(sampled: int, draws: list[int], sampled_logprob: float = -0.5) -> tuple[np.ndarray, np.ndarray]:
+def recorded_heads(sampled: int, draws: list[int], top_k: tuple[int, ...] = (0, 1, 2)) -> tuple[np.ndarray, np.ndarray]:
     """The [K] head ids and float32 logprobs the API server records for one generated position."""
-    ids, logprobs = encode_comparisons(
-        torch.tensor([draws]), torch.tensor([sampled]), torch.tensor([sampled_logprob]), K, K
+    carrier_ids, carrier_values = carrier_columns(torch.tensor([draws]), torch.tensor([[sampled, *top_k]]))
+    columns = zip(
+        [sampled, *top_k, *carrier_ids[0].tolist()],
+        [-0.5, *[-1.0] * len(top_k), *carrier_values[0].tolist()],
     )
-    columns = zip([sampled, *ids[0].tolist()], [sampled_logprob, *logprobs[0].tolist()])
     # vLLM folds a position's columns into a dict keyed by token id; a later column overwrites an earlier one.
     top_logprobs = {f"token_id:{token}": logprob for token, logprob in columns}
-    head_ids, head_logprobs = convert_vllm_comparison_heads([sampled], [top_logprobs], K)
+    _, row_draws = split_comparison_carriers([top_logprobs])
+    head_ids, head_logprobs = convert_comparison_heads(row_draws, K)
     return head_ids[0], head_logprobs[0]
 
 
-def float64_heads(head_logprobs: np.ndarray) -> np.ndarray:
-    """log(count / K) in float64 from the recorded float32 values; padding stays at COMPARISON_PAD_LOGPROB."""
-    counts = np.round(K * np.exp(head_logprobs.astype(np.float64)))
-    return np.where(counts > 0, np.log(np.maximum(counts, 1) / K), COMPARISON_PAD_LOGPROB)
+def float64_heads(head_logprobs: np.ndarray, k: int = K) -> np.ndarray:
+    """log(count / k) in float64 from the recorded float32 values; padding stays at COMPARISON_PAD_LOGPROB."""
+    counts = np.round(k * np.exp(head_logprobs.astype(np.float64)))
+    return np.where(counts > 0, np.log(np.maximum(counts, 1) / k), COMPARISON_PAD_LOGPROB)
 
 
 def kernel_loss(z, sampled, heads, advantages, weights, dtype=torch.float64, nll_value=False):
@@ -108,17 +115,25 @@ def test_float32_head_rounding_moves_the_gradient_by_the_rounding_only():
     torch.testing.assert_close(torch.autograd.grad(loss, z)[0], expected, atol=1e-6, rtol=0)
 
 
-def expected_gradient(p: np.ndarray, advantages: list[float], leave_in: bool) -> torch.Tensor:
-    """E over a ~ p and K (or K - 1 plus a) i.i.d. draws from p of the kernel gradient, by exact enumeration."""
+def expected_gradient(p: np.ndarray, advantages: list[float], k: int = K, leave_in: bool = False) -> torch.Tensor:
+    """E over a ~ p and the k-draw heads a lookup builds of the kernel gradient, by exact enumeration.
+
+    With leave_in the lookup takes k - 1 i.i.d. draws and the sampled token.
+    """
     z = torch.arange(VOCAB, dtype=torch.float64).cos().requires_grad_()
     sampled, heads, weights = [], [], []
     for a in range(len(p)):
-        for draws in itertools.combinations_with_replacement(range(len(p)), K - leave_in):
+        for draws in itertools.combinations_with_replacement(range(len(p)), k - leave_in):
             counts = np.bincount(draws, minlength=len(p))
             arrangements = math.factorial(len(draws)) / np.prod([math.factorial(c) for c in counts])
-            head_ids, head_logprobs = recorded_heads(a, list(draws))
+            if k == K and not leave_in:
+                head_ids, head_logprobs = recorded_heads(a, list(draws))
+            else:
+                recorded = np.asarray([draws], dtype=np.int32)
+                head_ids, head_logprobs = subsampled_comparison_heads(hash_tokens(draws), recorded, [a], k, leave_in)
+                head_ids, head_logprobs = head_ids[0], head_logprobs[0]
             sampled.append(a)
-            heads.append((head_ids, float64_heads(head_logprobs)))
+            heads.append((head_ids, float64_heads(head_logprobs, k)))
             weights.append(p[a] * arrangements * np.prod(p**counts))
     sampled = torch.tensor(sampled)
     weights = torch.tensor(weights, dtype=torch.float64)
@@ -131,19 +146,26 @@ def expected_gradient(p: np.ndarray, advantages: list[float], leave_in: bool) ->
 P = torch.tensor([1.0, 0.2, -0.5], dtype=torch.float64).div(0.7).softmax(-1).numpy()
 
 
-@pytest.mark.parametrize("leave_in", [False, True])
-def test_constant_advantage_has_zero_expected_gradient(leave_in):
-    gradient = expected_gradient(P, [1.0, 1.0, 1.0], leave_in)
+@pytest.mark.parametrize(("k", "leave_in"), [(K, False), (4, False), (4, True)])
+def test_constant_advantage_has_zero_expected_gradient(k, leave_in):
+    gradient = expected_gradient(P, [1.0, 1.0, 1.0], k, leave_in)
     torch.testing.assert_close(gradient, torch.zeros(VOCAB, dtype=torch.float64), atol=1e-12, rtol=0)
 
 
-def test_leave_in_mean_is_fifteen_sixteenths_of_the_independent_mean():
+def test_expected_gradient_is_the_sampler_advantage_covariance():
     advantages = [1.0, -0.5, 0.3]
-    independent = expected_gradient(P, advantages, leave_in=False)
-    leave_in = expected_gradient(P, advantages, leave_in=True)
-    # The independent mean is the descent direction of the sampler covariance Cov_p(A, e_a).
+    # The mean is the descent direction of Cov_p(A, e_a).
     mean = (P * advantages).sum()
     covariance = torch.zeros(VOCAB, dtype=torch.float64)
     covariance[: len(P)] = torch.tensor(P * (np.array(advantages) - mean))
-    torch.testing.assert_close(independent, -covariance, atol=1e-12, rtol=0)
-    torch.testing.assert_close(leave_in, independent * (K - 1) / K, atol=1e-12, rtol=0)
+    torch.testing.assert_close(expected_gradient(P, advantages), -covariance, atol=1e-12, rtol=0)
+    torch.testing.assert_close(expected_gradient(P, advantages, 4), -covariance, atol=1e-12, rtol=0)
+
+
+@pytest.mark.parametrize("k", [4, K])
+def test_leave_in_mean_is_k_minus_one_over_k_of_the_independent_mean(k):
+    advantages = [1.0, -0.5, 0.3]
+    independent = expected_gradient(P, advantages, k)
+    torch.testing.assert_close(
+        expected_gradient(P, advantages, k, leave_in=True), independent * (k - 1) / k, atol=1e-12, rtol=0
+    )

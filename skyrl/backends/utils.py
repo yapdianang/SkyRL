@@ -1,6 +1,5 @@
 """Shared helper utilities for TinkerEngine backends."""
 
-import itertools
 import math
 import time
 from contextlib import contextmanager
@@ -110,41 +109,55 @@ def convert_vllm_decode_logprobs(
 COMPARISON_PAD_LOGPROB = -1000.0
 
 
-def convert_vllm_comparison_heads(
-    token_ids: list[int],
+def split_comparison_carriers(
     raw_top_logprobs: list[dict[str, float]] | None,
-    k: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[list[dict[str, float]] | None, list[list[int]] | None]:
+    """Separate each position's decode logprobs from its comparison draws.
+
+    Under SKYRL_STABILIZED_COMPARISONS, vLLM appends one carrier entry per draw whose value is the drawn
+    token id + 1; real logprobs are never positive.
+    """
+    if raw_top_logprobs is None:
+        return None, None
+    logprobs, draws = [], []
+    for row in raw_top_logprobs:
+        logprobs.append({token: value for token, value in (row or {}).items() if value <= 0})
+        row_draws = [value - 1 for value in (row or {}).values() if value > 0]
+        if any(draw != int(draw) for draw in row_draws):
+            raise ValueError("comparison carriers must hold integer token IDs")
+        draws.append([int(draw) for draw in row_draws])
+    return logprobs, draws
+
+
+def convert_comparison_heads(draws, k: int) -> tuple[np.ndarray, np.ndarray]:
     """Heads [n, k] of each position's k comparison draws: the distinct drawn ids and log(count / k).
 
-    Under SKYRL_STABILIZED_COMPARISONS, vLLM lists each drawn id other than the sampled token with
-    log(count / k), so the sampled token's count is k minus the listed counts. Columns after the
-    distinct ids hold distinct unused ids at COMPARISON_PAD_LOGPROB, whose float32 probability is 0.
+    Columns after the distinct ids hold the smallest ids not drawn at COMPARISON_PAD_LOGPROB, whose
+    float32 probability is 0.
     """
-    if raw_top_logprobs is None or len(raw_top_logprobs) != len(token_ids):
-        raise ValueError("comparison heads must align with generated tokens")
-    ids = np.empty((len(token_ids), k), dtype=np.int32)
-    logprobs = np.full((len(token_ids), k), COMPARISON_PAD_LOGPROB, dtype=np.float32)
-    for row, (sampled, top) in enumerate(zip(token_ids, raw_top_logprobs)):
-        if not top or f"token_id:{sampled}" not in top:
-            raise ValueError("vLLM returned no decode logprob for a sampled token")
-        counts = {}
-        for token, logprob in top.items():
-            if not token.startswith("token_id:") or not token[9:].isdigit():
-                raise ValueError("comparison heads require numeric vLLM token IDs")
-            if int(token[9:]) == sampled:
-                continue
-            count = k * math.exp(logprob)
-            if round(count) < 1 or abs(count - round(count)) > 1e-3:
-                raise ValueError(f"decode logprob {logprob} is not log(count / {k}); vLLM returned no comparison draws")
-            counts[int(token[9:])] = round(count)
-        counts[sampled] = k - sum(counts.values())
-        if counts[sampled] < 0:
-            raise ValueError(f"comparison counts exceed {k}")
-        drawn = [token for token, count in counts.items() if count]
-        unused = (token for token in itertools.count() if token not in counts)
-        ids[row] = drawn + [next(unused) for _ in range(k - len(drawn))]
-        logprobs[row, : len(drawn)] = np.log(np.array([counts[token] for token in drawn]) / k)
+    draws = np.sort(np.asarray(draws, dtype=np.int64).reshape(-1, k), axis=1)
+    n = len(draws)
+    first = np.ones_like(draws, dtype=bool)
+    first[:, 1:] = draws[:, 1:] != draws[:, :-1]
+    # Slot r of a row holds its r-th distinct id; a row has distinct[row] of them.
+    slot = np.cumsum(first, axis=1) - 1
+    distinct = slot[:, -1] + 1
+    flat = (np.arange(n)[:, None] * k + slot).ravel()
+    counts = np.bincount(flat, minlength=n * k).reshape(n, k)
+    ids = np.zeros((n, k), dtype=np.int64)
+    ids.reshape(-1)[flat[first.ravel()]] = draws[first]
+    # At most k ids are drawn, so the 2k smallest ids hold k that are not; rows drawing none of them pad with 0..k-1.
+    unused = np.broadcast_to(np.arange(k), (n, k)).copy()
+    low = (draws < 2 * k).any(axis=1)
+    if low.any():
+        candidates = np.arange(2 * k)
+        drawn = (candidates[None, :, None] == draws[low][:, None, :]).any(-1)
+        unused[low] = candidates[np.argsort(drawn, axis=1, kind="stable")[:, :k]]
+    columns = np.arange(k)[None, :]
+    pads = np.take_along_axis(unused, np.clip(columns - distinct[:, None], 0, k - 1), axis=1)
+    has_draw = columns < distinct[:, None]
+    ids = np.where(has_draw, ids, pads).astype(np.int32)
+    logprobs = np.where(has_draw, np.log(np.maximum(counts, 1) / k), COMPARISON_PAD_LOGPROB).astype(np.float32)
     return ids, logprobs
 
 

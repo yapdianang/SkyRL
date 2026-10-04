@@ -58,7 +58,12 @@ from skyrl.tinker.db_models import (
     enable_sqlite_wal,
     get_async_database_url,
 )
-from skyrl.tinker.decode_heads import COMPARISONS_KEY, TURN_ENDS_KEY, DecodeHeadCache
+from skyrl.tinker.decode_heads import (
+    COMPARISONS_KEY,
+    LEAVE_IN_KEY,
+    TURN_ENDS_KEY,
+    DecodeHeadCache,
+)
 from skyrl.tinker.external_future_store import ExternalFutureStore
 from skyrl.tinker.extra import (
     ExternalInferenceClient,
@@ -387,20 +392,22 @@ async def lifespan(app: FastAPI):
 
     # Forwarded samples bypass the engine subprocess, so this process records their heads for forward_backward.
     app.state.decode_heads = None
-    if SKYRL_STABILIZED_COMPARISONS and SKYRL_STABILIZED_COMPARISONS != SKYRL_SCORE_CENTERING_RECORD_TOPK:
-        raise RuntimeError("SKYRL_STABILIZED_COMPARISONS requires an equal SKYRL_SCORE_CENTERING_RECORD_TOPK")
+    if SKYRL_STABILIZED_COMPARISONS and not SKYRL_SCORE_CENTERING_RECORD_TOPK:
+        raise RuntimeError("SKYRL_STABILIZED_COMPARISONS requires SKYRL_SCORE_CENTERING_RECORD_TOPK")
     if SKYRL_SCORE_CENTERING_RECORD_TOPK:
         if app.state.external_inference_client is None:
             raise RuntimeError("SKYRL_SCORE_CENTERING_RECORD_TOPK requires sample forwarding in the API server")
         app.state.decode_heads = DecodeHeadCache(
             SKYRL_SCORE_CENTERING_RECORD_TOPK,
             SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES,
-            comparisons=bool(SKYRL_STABILIZED_COMPARISONS),
+            comparisons=SKYRL_STABILIZED_COMPARISONS,
         )
         app.state.external_inference_client.decode_heads = app.state.decode_heads
-        k = SKYRL_SCORE_CENTERING_RECORD_TOPK
-        heads = f"{k}-draw comparison histograms" if SKYRL_STABILIZED_COMPARISONS else f"top-{k} heads"
-        logger.info(f"Recording decode {heads} (cap {SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES} bytes)")
+        draws = f" and {SKYRL_STABILIZED_COMPARISONS} comparison draws" if SKYRL_STABILIZED_COMPARISONS else ""
+        logger.info(
+            f"Recording decode top-{SKYRL_SCORE_CENTERING_RECORD_TOPK} heads{draws} "
+            f"(cap {SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES} bytes)"
+        )
 
     # Build subprocess command with engine config parameters.
     parent_cmd = psutil.Process(os.getppid()).cmdline()
@@ -738,6 +745,7 @@ class ForwardBackwardInput(BaseModel):
             "importance_sampling",
             "center_scores",
             COMPARISONS_KEY,
+            LEAVE_IN_KEY,
         },
         "gspo": {"clip_low_threshold", "clip_high_threshold"},
         "cispo": {"clip_low_threshold", "clip_high_threshold"},
@@ -1534,7 +1542,10 @@ async def _read_forward_backward_request(request: Request) -> tuple[ForwardBackw
 
 def _resolve_turn_ends(fb_input: ForwardBackwardInput, decode_heads: DecodeHeadCache | None, model_id: str) -> None:
     """Replace each datum's score_centering_turn_ends with the heads recorded for model_id's samples, in place."""
-    comparisons = (fb_input.loss_fn_config or {}).get(COMPARISONS_KEY, 0)
+    config = fb_input.loss_fn_config or {}
+    comparisons, leave_in = config.get(COMPARISONS_KEY, 0), config.get(LEAVE_IN_KEY, 0)
+    if comparisons != int(comparisons) or leave_in not in (0, 1) or (leave_in and not comparisons):
+        raise ValueError(f"{COMPARISONS_KEY} must be an integer and {LEAVE_IN_KEY} 0, or 1 with {COMPARISONS_KEY}")
     uses_turn_ends = [TURN_ENDS_KEY in datum.loss_fn_inputs for datum in fb_input.data]
     if not any(uses_turn_ends):
         if comparisons:
@@ -1546,10 +1557,11 @@ def _resolve_turn_ends(fb_input: ForwardBackwardInput, decode_heads: DecodeHeadC
         raise ValueError(f"Each datum of a batch must supply {TURN_ENDS_KEY}, or none may")
     if decode_heads is None:
         raise ValueError(f"{TURN_ENDS_KEY} requires SKYRL_SCORE_CENTERING_RECORD_TOPK on the server")
-    # A client and a server that disagree on the head form would train on the wrong centering.
-    recorded = decode_heads.k if decode_heads.comparisons else 0
-    if comparisons != recorded:
-        raise ValueError(f"{COMPARISONS_KEY}={comparisons:g} but the server records {recorded} comparison draws")
+    # Comparison heads that the server does not record would leave the request on the wrong centering.
+    if comparisons and not 1 <= comparisons <= decode_heads.comparisons:
+        raise ValueError(
+            f"{COMPARISONS_KEY}={comparisons:g} but the server records {decode_heads.comparisons} comparison draws"
+        )
     if fb_input.loss_fn not in ("ppo_score_centered", "reinforce_score_centered"):
         raise ValueError(f"{TURN_ENDS_KEY} requires a score-centered loss")
     k = (fb_input.loss_fn_config or {}).get("score_centering_k", 0)
@@ -1565,7 +1577,13 @@ def _resolve_turn_ends(fb_input: ForwardBackwardInput, decode_heads: DecodeHeadC
         if len(targets) != len(model_tokens) or len(weights) != len(targets) or targets[:-1] != model_tokens[1:]:
             raise ValueError("target_tokens and weights must align with model_input tokens shifted by one")
         ids, logprobs = decode_heads.place(
-            model_id, model_tokens + targets[-1:], inputs.pop(TURN_ENDS_KEY).data, weights, int(k)
+            model_id,
+            model_tokens + targets[-1:],
+            inputs.pop(TURN_ENDS_KEY).data,
+            weights,
+            int(k),
+            comparisons=int(comparisons),
+            leave_in=bool(leave_in),
         )
         inputs["topk_token_ids"] = TensorData(data=ids)
         inputs["topk_logprobs"] = TensorData(data=logprobs)
@@ -1797,7 +1815,7 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
     if request.topk_logprobs and SKYRL_STABILIZED_COMPARISONS:
         raise HTTPException(
             status_code=400,
-            detail="decode logprobs carry comparison draws under SKYRL_STABILIZED_COMPARISONS, not the top-k",
+            detail="decode topk_logprobs are unavailable: comparison draws follow the top-k under SKYRL_STABILIZED_COMPARISONS",
         )
 
     base_model, model_path = await get_sampling_model(request, req, session)

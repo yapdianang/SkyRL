@@ -671,6 +671,7 @@ class MegatronModelWrapper:
                 config_overrides.pop("importance_sampling", None)
                 config_overrides.pop("center_scores", None)
                 config_overrides.pop("score_centering_comparisons", None)
+                config_overrides.pop("score_centering_leave_in", None)
             new_loss_config = OmegaConf.merge(OmegaConf.create(asdict(loss_config)), OmegaConf.create(config_overrides))
             # NOTE: users can provide a custom loss config class, so we need to use the same class after applying overrides
             loss_config = type(loss_config).from_dict_config(new_loss_config)

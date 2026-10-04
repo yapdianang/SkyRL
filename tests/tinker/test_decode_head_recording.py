@@ -1,5 +1,7 @@
 import hashlib
+import itertools
 import json
+import math
 from collections import Counter
 from types import SimpleNamespace
 
@@ -11,11 +13,17 @@ import torch
 from tinker.proto.request_conv import forward_backward_request_to_proto
 
 from skyrl.backends.skyrl_train.patches.vllm.patch_stabilized_comparisons import (
-    encode_comparisons,
+    carrier_columns,
 )
-from skyrl.backends.utils import COMPARISON_PAD_LOGPROB
+from skyrl.backends.utils import COMPARISON_PAD_LOGPROB, convert_comparison_heads
 from skyrl.tinker import api
-from skyrl.tinker.decode_heads import COMPARISONS_KEY, DecodeHeadCache, hash_tokens
+from skyrl.tinker.decode_heads import (
+    COMPARISONS_KEY,
+    LEAVE_IN_KEY,
+    DecodeHeadCache,
+    hash_tokens,
+    subsampled_comparison_heads,
+)
 from skyrl.tinker.engine import prepare_model_pass_batch
 from skyrl.tinker.extra.external_inference import ExternalInferenceClient
 from skyrl.tinker.extra.skyrl_train_inference_forwarding import (
@@ -257,79 +265,173 @@ async def test_batch_accepts_exactly_one_head_form():
     assert request.forward_backward_input.data[0].loss_fn_inputs["topk_token_ids"].data == [0] * 20
 
 
-def comparison_body(sampled, sampled_logprobs, draws, k=16):
-    """vLLM's completion body for one sample under SKYRL_STABILIZED_COMPARISONS=k."""
-    ids, logprobs = encode_comparisons(torch.tensor(draws), torch.tensor(sampled), torch.tensor(sampled_logprobs), k, k)
-    # vLLM folds a position's columns, sampled token first, into a dict keyed by token id.
-    top_logprobs = [
-        {f"token_id:{token}": logprob for token, logprob in zip([s, *row_ids], [lp, *row_logprobs])}
-        for s, lp, row_ids, row_logprobs in zip(sampled, sampled_logprobs, ids.tolist(), logprobs.tolist())
-    ]
-    logprobs = {"token_logprobs": sampled_logprobs, "top_logprobs": top_logprobs}
-    return {"choices": [{"token_ids": sampled, "finish_reason": "stop", "logprobs": logprobs}]}
+def comparison_body(draws):
+    """VLLM_BODY with one carrier per comparison draw after each position's top-k, as the patched sampler returns it."""
+    body = json.loads(json.dumps(VLLM_BODY))
+    choice = body["choices"][0]
+    for top_logprobs, row_draws in zip(choice["logprobs"]["top_logprobs"], draws):
+        taken = torch.tensor([[int(token[9:]) for token in top_logprobs]])
+        ids, values = carrier_columns(torch.tensor([row_draws]), taken)
+        top_logprobs.update({f"token_id:{token}": value for token, value in zip(ids[0].tolist(), values[0].tolist())})
+    return body
+
+
+def histograms(cache, full_tokens, turn_ends, weights, comparisons, leave_in=False):
+    """Per-row {token: count} of the comparison heads a forward_backward lookup places."""
+    ids, logprobs = cache.place("base:model", full_tokens, turn_ends, weights, comparisons, comparisons, leave_in)
+    ids = np.asarray(ids).reshape(-1, comparisons)
+    logprobs = np.asarray(logprobs, dtype=np.float32).reshape(-1, comparisons)
+    rows = []
+    for row_ids, row_logprobs in zip(ids, logprobs):
+        drawn = row_logprobs > COMPARISON_PAD_LOGPROB
+        rows.append(dict(zip(row_ids[drawn].tolist(), np.round(comparisons * np.exp(row_logprobs[drawn])).tolist())))
+    return rows
+
+
+# Comparison draws at the two sampled positions of VLLM_BODY; both rows share ids with the top-k.
+DRAWS = [[99] * 5 + [10] * 7 + [12] * 4, [10] * 16]
 
 
 @pytest.mark.parametrize("forwarder", ["external", "skyrl_train"])
-@pytest.mark.parametrize("leave_in", [False, True])
 @pytest.mark.asyncio
-async def test_comparison_draws_are_recorded_as_their_histogram(forwarder, leave_in):
-    # Leave-in drops one draw; the sampled token is the 16th. Token 11 is never drawn at position 2.
-    draws = [row[leave_in:] for row in ([99] * 5 + [10] * 7 + [12] * 4, [10] * 16)]
-    body = comparison_body([99, 11], [-1.5, -0.25], draws)
-    cache = DecodeHeadCache(k=16, max_bytes=1 << 20, comparisons=True)
-    # Draws come from the processed law, so a modified sampling distribution is recorded.
-    payload, _ = await forward(forwarder, sample_request(temperature=0.7, top_k=5), cache, body)
-    assert payload["logprobs"] == 16 and payload["return_tokens_as_token_ids"] is True
+async def test_one_server_records_top_k_heads_and_comparison_draws(forwarder):
+    top_k_only = DecodeHeadCache(k=2, max_bytes=1 << 20)
+    await forward(forwarder, sample_request(), top_k_only)
+    cache = DecodeHeadCache(k=2, max_bytes=1 << 20, comparisons=16)
+    payload, result = await forward(forwarder, sample_request(), cache, comparison_body(DRAWS))
+    assert payload["logprobs"] == 2 + 16 and payload["return_tokens_as_token_ids"] is True
+    full, weights = [1, 2, 99, 11], [0.0, 1.0, 1.0]
 
-    ids, logprobs = cache.place("base:model", [1, 2, 99, 11], [4], [0.0, 1.0, 1.0], 16)
-    for row, sampled, row_draws in zip((1, 2), (99, 11), draws):
-        head_ids = np.asarray(ids).reshape(3, 16)[row]
-        head_logprobs = np.asarray(logprobs, dtype=np.float32).reshape(3, 16)[row]
-        drawn = head_logprobs > COMPARISON_PAD_LOGPROB
-        histogram = dict(zip(head_ids[drawn].tolist(), np.round(16 * np.exp(head_logprobs[drawn])).tolist()))
-        assert histogram == Counter(row_draws + [sampled] * leave_in)
-        assert len(set(head_ids.tolist())) == 16 and (head_logprobs[~drawn] == COMPARISON_PAD_LOGPROB).all()
+    # Top-k heads are those of a top-k-only (-sc2) server; the comparison histograms are the draws.
+    assert cache.place("base:model", full, [4], weights, 2) == top_k_only.place("base:model", full, [4], weights, 2)
+    assert histograms(cache, full, [4], weights, 16)[1:] == [Counter(row) for row in DRAWS]
 
-    cache = DecodeHeadCache(k=16, max_bytes=1 << 20, comparisons=True)
-    payload, _ = await forward(forwarder, sample_request(temperature=0.0), cache, body)
+    # A modified sampling law records only the draws, which come from the processed law; greedy records nothing.
+    cache = DecodeHeadCache(k=2, max_bytes=1 << 20, comparisons=16)
+    payload, _ = await forward(forwarder, sample_request(temperature=0.7), cache, comparison_body(DRAWS))
+    assert payload["logprobs"] == 18
+    with pytest.raises(ValueError, match="no heads recorded"):
+        cache.place("base:model", full, [4], weights, 2)
+    assert histograms(cache, full, [4], weights, 16)[1:] == [Counter(row) for row in DRAWS]
+    cache = DecodeHeadCache(k=2, max_bytes=1 << 20, comparisons=16)
+    payload, _ = await forward(forwarder, sample_request(temperature=0.0), cache, comparison_body(DRAWS))
     assert payload["logprobs"] in (1, True) and cache.nbytes == 0
 
 
-def test_top_k_logprobs_are_not_recorded_as_comparisons():
-    cache = DecodeHeadCache(k=2, max_bytes=1 << 20, comparisons=True)
-    top_logprobs = VLLM_BODY["choices"][0]["logprobs"]["top_logprobs"]
-    cache.record("m", [1, 2], [99, 11], [-4.0, -0.2], top_logprobs)
-    assert cache.nbytes == 0
+def test_missing_draws_leave_the_top_k_heads():
+    cache = DecodeHeadCache(k=2, max_bytes=1 << 20, comparisons=16)
+    logprobs = VLLM_BODY["choices"][0]["logprobs"]
+    sampling_params = api.SamplingParams(max_tokens=2)
+    cache.record("m", [1, 2], [99, 11], logprobs["token_logprobs"], logprobs["top_logprobs"], sampling_params)
+    assert cache.get(("m", hash_tokens([1, 2, 99, 11]))) is not None
+    with pytest.raises(ValueError, match="no heads recorded"):
+        cache.place("m", [1, 2, 99, 11], [4], [0.0, 1.0, 1.0], 16, comparisons=16)
 
 
-def comparison_cache():
-    cache = DecodeHeadCache(k=16, max_bytes=1 << 20, comparisons=True)
+RECORDED = np.array([[0] * 9 + [1] * 5 + [2] * 2], dtype=np.int32)
+
+
+def test_full_subset_is_the_recorded_histogram_and_repeats_are_identical():
+    ids, logprobs = subsampled_comparison_heads(hash_tokens([7]), RECORDED, [1], 16, leave_in=False)
+    drawn = logprobs[0] > COMPARISON_PAD_LOGPROB
+    assert dict(zip(ids[0][drawn].tolist(), np.round(16 * np.exp(logprobs[0][drawn])).tolist())) == {0: 9, 1: 5, 2: 2}
+    for leave_in in (False, True):
+        first = subsampled_comparison_heads(hash_tokens([7]), RECORDED, [1], 4, leave_in)
+        np.testing.assert_array_equal(first, subsampled_comparison_heads(hash_tokens([7]), RECORDED, [1], 4, leave_in))
+    ids, logprobs = subsampled_comparison_heads(hash_tokens([7]), RECORDED, [2], 1, leave_in=True)
+    assert ids[0, 0] == 2 and logprobs[0, 0] == 0.0
+
+
+def test_heads_pad_with_the_smallest_ids_not_drawn():
+    ids, logprobs = convert_comparison_heads([[205] * 7 + [100] * 9, [1] * 8 + [3] * 8], 16)
+    assert ids[0].tolist() == [100, 205, *range(14)] and ids[1].tolist() == [1, 3, 0, 2, *range(4, 16)]
+    np.testing.assert_allclose(logprobs[:, :2], np.log([[9 / 16, 7 / 16], [0.5, 0.5]]), rtol=1e-6)
+    assert (logprobs[:, 2:] == COMPARISON_PAD_LOGPROB).all()
+
+
+def multinomial(counts, p):
+    return math.factorial(sum(counts)) * math.prod(q**c / math.factorial(c) for q, c in zip(p, counts))
+
+
+def hypergeometric(subset, recorded):
+    return math.prod(math.comb(r, s) for r, s in zip(recorded, subset)) / math.comb(sum(recorded), sum(subset))
+
+
+def compositions(total, parts):
+    """Every count vector of `parts` nonnegative integers summing to `total`."""
+    for bars in itertools.combinations(range(total + parts - 1), parts - 1):
+        edges = (-1, *bars, total + parts - 1)
+        yield tuple(right - left - 1 for left, right in zip(edges, edges[1:]))
+
+
+@pytest.mark.parametrize("k", [1, 2, 4, 8, 16])
+def test_a_uniform_subset_of_iid_draws_is_iid(k):
+    # Exact: sum_h Multinomial(16; p)(h) Hypergeometric(s | h, k) = Multinomial(k; p)(s).
+    p = (0.55, 0.3, 0.15)
+    for subset in compositions(k, 3):
+        mixture = sum(
+            multinomial(recorded, p) * hypergeometric(subset, recorded)
+            for recorded in compositions(16, 3)
+            if all(s <= r for s, r in zip(subset, recorded))
+        )
+        assert mixture == pytest.approx(multinomial(subset, p), abs=1e-12)
+
+
+def test_seeded_subsets_follow_the_hypergeometric_law():
+    k, keys = 4, 6000
+    observed = Counter()
+    for key in range(keys):
+        ids, logprobs = subsampled_comparison_heads(hash_tokens([key]), RECORDED, [0], k, leave_in=False)
+        counts = dict(zip(ids[0].tolist(), np.round(k * np.exp(logprobs[0])).tolist()))
+        observed[tuple(int(counts.get(token, 0)) for token in range(3))] += 1
+    subsets = [s for s in compositions(k, 3) if s[2] <= 2]
+    expected = {s: keys * hypergeometric(s, (9, 5, 2)) for s in subsets}
+    assert sum(observed.values()) == keys and set(observed) <= set(subsets)
+    chi_square = sum((observed[s] - e) ** 2 / e for s, e in expected.items())
+    assert chi_square < 31.264  # 0.999 quantile, 11 degrees of freedom for 12 subsets
+
+
+def comparison_cache(draws=16):
+    cache = DecodeHeadCache(k=32, max_bytes=1 << 20, comparisons=draws)
     for start, end in ((3, 5), (8, 11)):
-        ids = np.arange(16 * (end - start), dtype=np.int32).reshape(-1, 16)
-        cache.put("model", FULL[:end], start, ids, np.full(ids.shape, -np.log(16), dtype=np.float32))
+        rows = np.arange(16 * (end - start), dtype=np.int32).reshape(-1, 16) % 7
+        cache.put("model", FULL[:end], start, rows, comparisons=True)
+        cache.put("model", FULL[:end], start, rows + 100, np.full(rows.shape, -1.0, dtype=np.float32))
     return cache
 
 
 @pytest.mark.asyncio
-async def test_comparison_heads_need_the_matching_request_key():
+async def test_each_request_selects_its_heads_and_mismatches_fail():
     datums = [datum_inputs(score_centering_turn_ends=([5, 11], "int64"))]
-    config = {"score_centering_k": 16.0, COMPARISONS_KEY: 16.0}
-    request = await resolved_request(comparison_cache(), datums, "reinforce_score_centered", config)
-    # The key stays for the backend, which then reports the weighted NLL like native stabilized_reinforce.
-    assert request.forward_backward_input.loss_fn_config == config
-    assert request.forward_backward_input.data[0].loss_fn_inputs["topk_token_ids"].data[2 * 16 : 3 * 16] == list(
-        range(16)
-    )
+    # Row 2 holds the first sampled position, whose target token is FULL[3].
+    for loss_fn_config, contains in (
+        ({"score_centering_k": 16.0}, {100, 101, 106}),
+        ({"score_centering_k": 16.0, COMPARISONS_KEY: 16.0}, set(range(7))),
+        ({"score_centering_k": 4.0, COMPARISONS_KEY: 4.0, LEAVE_IN_KEY: 1.0}, {FULL[3]}),
+    ):
+        request = await resolved_request(comparison_cache(), datums, "reinforce_score_centered", loss_fn_config)
+        k = int(loss_fn_config["score_centering_k"])
+        # The keys stay for the backend, which reports the weighted NLL like native stabilized_reinforce.
+        assert request.forward_backward_input.loss_fn_config == loss_fn_config
+        inputs = request.forward_backward_input.data[0].loss_fn_inputs
+        row_ids = inputs["topk_token_ids"].data[2 * k : 3 * k]
+        row_logprobs = inputs["topk_logprobs"].data[2 * k : 3 * k]
+        assert contains <= {i for i, lp in zip(row_ids, row_logprobs) if lp > COMPARISON_PAD_LOGPROB}
 
     for cache, loss_fn_config, message in (
-        (comparison_cache(), {"score_centering_k": 16.0}, "records 16 comparison draws"),
-        (two_turn_cache(), {"score_centering_k": float(K), COMPARISONS_KEY: 16.0}, "records 0 comparison draws"),
-        (comparison_cache(), {"score_centering_k": 8.0, COMPARISONS_KEY: 16.0}, "truncate"),
+        (two_turn_cache(), {"score_centering_k": 16.0, COMPARISONS_KEY: 16.0}, "records 0 comparison draws"),
+        (comparison_cache(), {"score_centering_k": 32.0, COMPARISONS_KEY: 32.0}, "records 16 comparison draws"),
+        (comparison_cache(), {"score_centering_k": 8.0, COMPARISONS_KEY: 4.0}, "must equal"),
+        (comparison_cache(), {"score_centering_k": 4.0, COMPARISONS_KEY: 2.5}, "must be an integer"),
+        (comparison_cache(), {"score_centering_k": 4.0, LEAVE_IN_KEY: 1.0}, "must be an integer"),
+        (comparison_cache(), {"score_centering_k": 4.0, COMPARISONS_KEY: 4.0, LEAVE_IN_KEY: 2.0}, "must be"),
     ):
         with pytest.raises(ValueError, match=message):
             await resolved_request(cache, datums, "reinforce_score_centered", loss_fn_config)
     with pytest.raises(ValueError, match=f"{COMPARISONS_KEY} requires"):
-        await resolved_request(comparison_cache(), [datum_inputs()], "reinforce_score_centered", config)
+        await resolved_request(
+            comparison_cache(), [datum_inputs()], "reinforce_score_centered", {COMPARISONS_KEY: 16.0}
+        )
 
 
 @pytest.mark.asyncio

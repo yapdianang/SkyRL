@@ -182,6 +182,7 @@ class ExternalInferenceClient:
                     choice["token_ids"],
                     lp["token_logprobs"],
                     lp.get("top_logprobs"),
+                    request.sampling_params,
                 )
             sequences.append(
                 types.GeneratedSequence(

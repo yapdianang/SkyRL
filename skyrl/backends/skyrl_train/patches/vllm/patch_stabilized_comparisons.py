@@ -1,15 +1,17 @@
-"""Runtime patch: decode logprob columns carry K i.i.d. comparison draws instead of the top-k.
+"""Runtime patch: decode logprobs also carry K i.i.d. comparison draws from the processed sampling law.
 
-With ``SKYRL_STABILIZED_COMPARISONS=K``, the columns after the sampled token at each generated
-position list every distinct drawn token other than the sampled token once, with log(count / K),
-followed by copies of the sampled token with its own logprob. vLLM folds a position's columns into a
-dict keyed by token id (``append_logprobs_for_next_position``), so a repeated id cannot be returned,
-and a comparison column holding the sampled id would overwrite the sampled token's logprob. The
-sampled token's count is therefore implicit: K minus the listed counts.
+With ``SKYRL_STABILIZED_COMPARISONS=K``, a batch whose largest decode logprob request ``n`` exceeds K
+returns, per generated position, the sampled token, the top ``n - K`` tokens as usual, and then K
+carrier columns, one per draw. vLLM folds a position's columns into a dict keyed by token id
+(``append_logprobs_for_next_position``), which would merge a draw with a top-k column of the same id.
+So a carrier's id is a filler id that is in no other column of its position, and its value is
+``drawn_id + 1``: a positive integer, exact in float32 and kept by the completions API's -9999 floor,
+while real logprobs are never positive. A request for at most ``n - K`` logprobs receives its usual
+top-k from the same batch.
 
-The draws are i.i.d. from the softmax of the tensor that the top-k would be taken from. Under the
-required ``logprobs_mode=processed_logprobs``, that tensor is the one the sampled token was drawn from,
-after temperature, min_p and top-k/top-p:
+The draws are i.i.d. from the softmax of the tensor the top-k is taken from. Under the required
+``logprobs_mode=processed_logprobs``, that tensor is the one the sampled token was drawn from, after
+temperature, min_p and top-k/top-p:
 
 - V1 model runner: ``Sampler.gather_logprobs`` receives ``log_softmax`` of the logits that
   ``TopKTopPSampler.forward_native`` turns into the probabilities of ``random_sample``.
@@ -17,7 +19,6 @@ after temperature, min_p and top-k/top-p:
   sampled from.
 
 The draws use torch's global generator after the token is sampled, so they are independent of it.
-``SKYRL_STABILIZED_LEAVE_IN=1`` draws K - 1 tokens and counts the sampled token as the K-th draw.
 
 Patched names (vLLM 0.30.0):
 
@@ -27,15 +28,15 @@ Patched names (vLLM 0.30.0):
   The V2 prompt-logprob and rejection-sampler modules import their own binding and keep the top-k.
 - ``__init__`` of both samplers, to reject any ``logprobs_mode`` other than ``processed_logprobs``.
 
-A batch whose largest logprob request is below K, or that has speculative tokens or per-request
-``logprob_token_ids``, keeps the top-k. The API server rejects such rows as comparison heads.
+Batches with speculative tokens or per-request ``logprob_token_ids`` keep the plain top-k; the API
+server then finds no draws and does not record comparison heads.
 """
 
 import contextvars
 
 import torch
 
-from skyrl.env_vars import SKYRL_STABILIZED_COMPARISONS, SKYRL_STABILIZED_LEAVE_IN
+from skyrl.env_vars import SKYRL_STABILIZED_COMPARISONS
 from skyrl.utils.log import logger
 
 PROCESSED_LOGPROBS = "processed_logprobs"
@@ -52,36 +53,25 @@ def draw_comparisons(scores: torch.Tensor, sampled: torch.Tensor, n: int) -> tor
     return torch.multinomial(probs, n, replacement=True)
 
 
-def encode_comparisons(
-    draws: torch.Tensor, sampled: torch.Tensor, sampled_logprobs: torch.Tensor, num_columns: int, k: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Encode [rows, n <= k] draws as [rows, num_columns] ids and logprobs, counts out of k.
+def carrier_columns(draws: torch.Tensor, taken: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """[rows, K] carrier ids and values for [rows, K] draws: filler ids absent from ``taken``, values draw + 1.
 
-    Distinct draws other than ``sampled`` come first with log(count / k); the remaining columns repeat
-    ``sampled`` with ``sampled_logprobs``.
+    ``taken`` holds each row's other column ids, at most ``c - K`` distinct of them for ``c`` candidate
+    fillers ``0..c-1``, so at least K fillers are free.
     """
-    draws = draws.sort(-1).values
-    counts = (draws[:, :, None] == draws[:, None, :]).sum(-1)
-    listed = draws != sampled[:, None]
-    listed[:, 1:] &= draws[:, 1:] != draws[:, :-1]
-    order = torch.argsort((~listed).to(torch.uint8), dim=-1, stable=True)
-    listed = listed.gather(-1, order)
-    ids = torch.where(listed, draws.gather(-1, order), sampled[:, None])
-    logprobs = torch.where(listed, (counts.gather(-1, order).float() / k).log(), sampled_logprobs[:, None])
-    pad = num_columns - ids.shape[1]
-    return (
-        torch.cat((ids, sampled[:, None].expand(-1, pad)), dim=1),
-        torch.cat((logprobs, sampled_logprobs[:, None].expand(-1, pad)), dim=1),
-    )
+    k = draws.shape[1]
+    candidates = torch.arange(taken.shape[1] + k, device=draws.device)
+    used = (candidates[None, :, None] == taken[:, None, :]).any(-1)
+    free_first = torch.argsort(used.to(torch.uint8), dim=-1, stable=True)[:, :k]
+    return candidates[free_first], (draws + 1).float()
 
 
-def _with_comparisons(base, scores: torch.Tensor, sampled: torch.Tensor, num_columns: int, k: int, leave_in: bool):
-    """Append comparison columns to LogprobsTensors that hold only the sampled-token column."""
-    draws = draw_comparisons(scores, sampled, k - leave_in)
-    ids, logprobs = encode_comparisons(draws, sampled, base.logprobs[:, 0], num_columns, k)
+def _with_comparisons(base, scores: torch.Tensor, sampled: torch.Tensor, k: int):
+    """Append K carrier columns to LogprobsTensors holding the sampled token and the top-k."""
+    ids, values = carrier_columns(draw_comparisons(scores, sampled, k), base.logprob_token_ids.long())
     return base._replace(
         logprob_token_ids=torch.cat((base.logprob_token_ids, ids.to(base.logprob_token_ids.dtype)), dim=1),
-        logprobs=torch.cat((base.logprobs, logprobs), dim=1),
+        logprobs=torch.cat((base.logprobs, values.to(base.logprobs.dtype)), dim=1),
     )
 
 
@@ -99,7 +89,7 @@ def _require_processed_logprobs(sampler_cls) -> None:
     sampler_cls.__init__ = __init__
 
 
-def _patch_v1(k: int, leave_in: bool) -> None:
+def _patch_v1(k: int) -> None:
     from vllm.v1.sample.sampler import Sampler
 
     forward, gather_logprobs = Sampler.forward, Sampler.gather_logprobs
@@ -112,42 +102,36 @@ def _patch_v1(k: int, leave_in: bool) -> None:
             _DECODING.reset(token)
 
     def patched_gather_logprobs(logprobs, num_logprobs, token_ids):
-        if not _DECODING.get() or num_logprobs < k:
+        if not _DECODING.get() or num_logprobs <= k:
             return gather_logprobs(logprobs, num_logprobs, token_ids)
-        return _with_comparisons(
-            gather_logprobs(logprobs, 0, token_ids), logprobs, token_ids, num_logprobs, k, leave_in
-        )
+        return _with_comparisons(gather_logprobs(logprobs, num_logprobs - k, token_ids), logprobs, token_ids, k)
 
     _require_processed_logprobs(Sampler)
     Sampler.forward = patched_forward
     Sampler.gather_logprobs = staticmethod(patched_gather_logprobs)
 
 
-def _patch_v2(k: int, leave_in: bool) -> None:
+def _patch_v2(k: int) -> None:
     from vllm.v1.worker.gpu.sample import sampler
 
     compute_topk_scores = sampler.compute_topk_scores
 
     def patched_compute_topk_scores(logits, num_logprobs, sampled_token_ids, cu_num_logits=None, **kwargs):
-        if num_logprobs < k or cu_num_logits is not None or kwargs.get("max_per_req_token_ids"):
+        if num_logprobs <= k or cu_num_logits is not None or kwargs.get("max_per_req_token_ids"):
             return compute_topk_scores(logits, num_logprobs, sampled_token_ids, cu_num_logits, **kwargs)
-        base = compute_topk_scores(logits, 0, sampled_token_ids, cu_num_logits, **kwargs)
-        return _with_comparisons(base, logits, sampled_token_ids, num_logprobs, k, leave_in)
+        base = compute_topk_scores(logits, num_logprobs - k, sampled_token_ids, cu_num_logits, **kwargs)
+        return _with_comparisons(base, logits, sampled_token_ids, k)
 
     _require_processed_logprobs(sampler.Sampler)
     sampler.compute_topk_scores = patched_compute_topk_scores
 
 
-def apply_stabilized_comparisons_patch(
-    k: int = SKYRL_STABILIZED_COMPARISONS, leave_in: bool = SKYRL_STABILIZED_LEAVE_IN
-) -> None:
+def apply_stabilized_comparisons_patch(k: int = SKYRL_STABILIZED_COMPARISONS) -> None:
     """Patch both vLLM model runners' decode logprobs; a no-op when k is 0. Idempotent per process."""
     global _PATCHED
     if _PATCHED or not k:
         return
-    if k < 1 + leave_in:
-        raise ValueError(f"SKYRL_STABILIZED_COMPARISONS={k} leaves no comparison draw")
-    _patch_v1(k, leave_in)
-    _patch_v2(k, leave_in)
+    _patch_v1(k)
+    _patch_v2(k)
     _PATCHED = True
-    logger.info(f"Decode logprobs carry {k} comparison draws (leave_in={leave_in}) in vLLM V1 and V2 samplers")
+    logger.info(f"Decode logprobs carry {k} comparison draws after the top-k in vLLM V1 and V2 samplers")
