@@ -90,6 +90,19 @@ def add_score_centering_inputs(batch, prepared, response_length):
     batch["loss_mask"] = normalized
 
 
+def _describe_nonfinite(values, logp, old, head_p, head_q) -> str:
+    """Which active-token inputs are nonfinite or extreme where ``values`` is nonfinite."""
+    bad = ~torch.isfinite(values.detach())
+    logp, head_p = logp.detach(), head_p.detach()
+    return (
+        f"{int(bad.sum())} of {bad.numel()} active tokens; logp nonfinite={int((~torch.isfinite(logp)).sum())} "
+        f"range=[{logp.min().item():.4g}, {logp.max().item():.4g}]; old nonfinite={int((~torch.isfinite(old)).sum())} "
+        f"range=[{old.min().item():.4g}, {old.max().item():.4g}]; head_p nonfinite={int((~torch.isfinite(head_p)).sum())}; "
+        f"head_q nonfinite={int((~torch.isfinite(head_q)).sum())}; at bad tokens logp={logp[bad][:4].tolist()} "
+        f"old={old[bad][:4].tolist()}"
+    )
+
+
 def score_centered_ppo_loss(
     logp,
     old,
@@ -116,7 +129,7 @@ def score_centered_ppo_loss(
     weights = weights[active]
     ratio = (logp - old).exp()
     if not torch.isfinite(ratio).all():
-        raise ValueError("Nonfinite PPO importance ratio")
+        raise ValueError(f"Nonfinite PPO importance ratio: {_describe_nonfinite(ratio, logp, old, head_p, head_q)}")
     surrogate = -torch.minimum(ratio * advantages, ratio.clamp(1 - eps_low, 1 + eps_high) * advantages)
     with torch.no_grad():
         positive = advantages >= 0
@@ -211,5 +224,5 @@ def score_centered_reinforce_loss(
     if kl_coef:
         loss = loss + kl_coef * 0.5 * (logp - reference.detach()[active]).square()
     if not torch.isfinite(loss).all():
-        raise ValueError("Nonfinite score-centered REINFORCE loss")
+        raise ValueError(f"Nonfinite score-centered REINFORCE loss: {_describe_nonfinite(loss, logp, old, head_p, head_q)}")
     return (loss * weights[active]).sum()
