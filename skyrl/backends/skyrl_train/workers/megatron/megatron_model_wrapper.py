@@ -842,6 +842,14 @@ class MegatronModelWrapper:
                         center_scores=(loss_fn_config or {}).get("center_scores", True),
                         # The stabilized_reinforce replica reports native's forward loss, the weighted NLL.
                         nll_value=bool((loss_fn_config or {}).get("score_centering_comparisons", 0)),
+                        importance_band=(
+                            (
+                                (loss_fn_config or {})["importance_band_low"],
+                                (loss_fn_config or {})["importance_band_high"],
+                            )
+                            if "importance_band_low" in (loss_fn_config or {})
+                            else None
+                        ),
                     )
                     loss_metrics = {}
                 else:

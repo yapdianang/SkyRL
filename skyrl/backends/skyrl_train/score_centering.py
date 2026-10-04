@@ -168,8 +168,13 @@ def score_centered_reinforce_loss(
     importance_sampling=True,
     center_scores=True,
     nll_value=False,
+    importance_band=None,
 ):
     """Top-k TIS + score centering, arXiv:2609.20807 equation 12.
+
+    importance_band=(low, high) replaces truncation by the masked weight f(r) = r on (1 - low, 1 + high), else 0,
+    on the sampled token, the head (q * f(p / q)) and the modeled tail (rho * f(1 / rho)), as SkyRL #2244's
+    rollout_is loss does.
 
     nll_value keeps the centering in the gradient only, so the loss value is -A * logp plus the K2 term,
     as native stabilized_reinforce reports it.
@@ -182,7 +187,17 @@ def score_centered_reinforce_loss(
         p = head_p.exp()
         q_tail = (1 - head_q.exp().sum(-1)).clamp_min(0)
         p_tail = (1 - p.sum(-1)).clamp_min(1e-6)
-        if importance_sampling:
+        if importance_band is not None:
+            low, high = importance_band
+
+            def masked(r):
+                return torch.where((r > 1 - low) & (r < 1 + high), r, torch.zeros_like(r))
+
+            rho = q_tail.clamp_min(1e-6) / p_tail
+            head_ratio = (head_p.detach() - head_q).clamp(-20.0, 20.0).exp()
+            residual = head_q.exp() * masked(head_ratio) - (rho * masked(1 / rho))[:, None] * p
+            sampled_weight = masked((logp.detach() - old).exp())
+        elif importance_sampling:
             alpha = torch.minimum(torch.ones_like(p_tail), importance_cap * q_tail / p_tail)
             residual = torch.minimum(p, importance_cap * head_q.exp()) - alpha[:, None] * p
             sampled_weight = (logp - old).clamp_max(math.log(importance_cap)).exp()
