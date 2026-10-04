@@ -94,3 +94,15 @@ def test_k2_gradient_uses_the_fixed_reference_with_zero_advantage():
     actual = torch.autograd.grad(loss, logits, retain_graph=True)[0]
     expected = torch.autograd.grad((0.0005 * (lp - reference).square() * q).sum(), logits)[0]
     torch.testing.assert_close(actual, expected)
+
+
+def test_without_ratio_the_expected_gradient_is_the_sampler_advantage_covariance():
+    logits = torch.tensor([1.2, -0.4, 0.3, 0.9], dtype=torch.float64, requires_grad=True)
+    lp = logits.log_softmax(-1)
+    q = torch.tensor([0.1, 0.5, 0.15, 0.25], dtype=torch.float64)
+    advantages = torch.tensor([0.0, 1.0, -0.5, 0.3], dtype=torch.float64)
+    loss = score_centered_reinforce_loss(
+        lp, q.log(), advantages, lp.expand(4, -1), q.log().expand(4, -1), q, 2.0, importance_sampling=False
+    )
+    expected = -q * (advantages - (q * advantages).sum())
+    torch.testing.assert_close(torch.autograd.grad(loss, logits)[0], expected, atol=1e-12, rtol=0)
