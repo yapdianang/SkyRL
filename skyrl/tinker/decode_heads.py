@@ -2,7 +2,7 @@
 
 import hashlib
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 import numpy as np
 
@@ -23,9 +23,17 @@ def hash_tokens(tokens: list[int]) -> str:
     return hashlib.sha256(np.asarray(tokens, dtype="<i8").tobytes()).hexdigest()
 
 
-class DecodeHeadCache:
-    """LRU map from hash(prompt + sampled tokens) to (prompt_length, ids [n, k] int32, logprobs [n, k] float32).
+def sampling_model(model_id: str, base_model: str | None) -> str:
+    """The model a forwarded sample came from: the model id whose sampler weights served it, or the base model."""
+    return model_id if model_id else f"base:{base_model}"
 
+
+class DecodeHeadCache:
+    """LRU map from (sampling model, hash(prompt + sampled tokens)) to (prompt_length, ids [n, k], logprobs [n, k]).
+
+    forward_backward looks heads up under its own model id, so runs on different LoRA adapters of one service
+    never read each other's heads; base-model samples are never served to a training model. A later sample of
+    the same model and tokens replaces the earlier heads (last writer wins) and counts as an overwrite.
     Forwarding tasks write and forward_backward reads on the API event loop, so there is no lock.
     """
 
@@ -36,8 +44,11 @@ class DecodeHeadCache:
         self.max_bytes = max_bytes
         self.nbytes = 0
         self.evictions = 0
-        self._entries: OrderedDict[str, tuple[int, np.ndarray, np.ndarray]] = OrderedDict()
+        self.records: Counter[str] = Counter()
+        self.overwrites: Counter[str] = Counter()
+        self._entries: OrderedDict[tuple[str, str], tuple[int, np.ndarray, np.ndarray]] = OrderedDict()
         self._last_eviction_log = float("-inf")
+        self._last_overwrite_log = float("-inf")
 
     def record_topk(self, sampling_params) -> int:
         """vLLM logprobs describe the sampling distribution only when sampling does not modify it.
@@ -49,7 +60,7 @@ class DecodeHeadCache:
         unmodified = sampling_params.temperature == 1 and sampling_params.top_p == 1 and sampling_params.top_k == -1
         return self.k if unmodified else 0
 
-    def record(self, prompt_tokens: list[int], tokens: list[int], token_logprobs, raw_top_logprobs) -> None:
+    def record(self, model: str, prompt_tokens: list[int], tokens: list[int], token_logprobs, raw_top_logprobs):
         if not tokens:
             return
         try:
@@ -62,12 +73,20 @@ class DecodeHeadCache:
             # The sample still succeeds; training on it fails later with the missing hash.
             logger.warning(f"Decode heads not recorded: {e}")
             return
-        self.put(prompt_tokens + tokens, len(prompt_tokens), ids, logprobs)
+        self.put(model, prompt_tokens + tokens, len(prompt_tokens), ids, logprobs)
 
-    def put(self, tokens: list[int], prompt_length: int, ids: np.ndarray, logprobs: np.ndarray) -> None:
-        key = hash_tokens(tokens)
+    def put(self, model: str, tokens: list[int], prompt_length: int, ids: np.ndarray, logprobs: np.ndarray) -> None:
+        key = (model, hash_tokens(tokens))
+        self.records[model] += 1
         if (old := self._entries.pop(key, None)) is not None:
             self.nbytes -= old[1].nbytes + old[2].nbytes
+            self.overwrites[model] += 1
+            now = time.monotonic()
+            if now - self._last_overwrite_log >= _EVICTION_LOG_INTERVAL_SECONDS:
+                self._last_overwrite_log = now
+                logger.warning(
+                    f"Decode head overwrites by model so far: {dict(self.overwrites)} of {dict(self.records)}"
+                )
         self._entries[key] = (prompt_length, ids, logprobs)
         self.nbytes += ids.nbytes + logprobs.nbytes
         evicted = 0
@@ -84,14 +103,23 @@ class DecodeHeadCache:
                 f"(cap {self.max_bytes} bytes, {len(self._entries)} entries held)"
             )
 
-    def get(self, key: str) -> tuple[int, np.ndarray, np.ndarray] | None:
+    def get(self, key: tuple[str, str]) -> tuple[int, np.ndarray, np.ndarray] | None:
         entry = self._entries.get(key)
         if entry is not None:
             self._entries.move_to_end(key)
         return entry
 
+    def stats(self) -> dict:
+        models = sorted(self.records)
+        return {
+            "models": {m: {"records": self.records[m], "overwrites": self.overwrites[m]} for m in models},
+            "entries": len(self._entries),
+            "bytes": self.nbytes,
+            "evictions": self.evictions,
+        }
+
     def place(
-        self, full_tokens: list[int], turn_ends: list[int], weights: list[float], k: int
+        self, model: str, full_tokens: list[int], turn_ends: list[int], weights: list[float], k: int
     ) -> tuple[list[int], list[float]]:
         """Return flat [n, k] heads aligned with targets full_tokens[1:]; turn rows go to targets [start - 1, end - 1)."""
         if k > self.k:
@@ -109,7 +137,7 @@ class DecodeHeadCache:
                 raise ValueError(f"{TURN_ENDS_KEY} must be strictly increasing int64 positions, got {turn_ends}")
             previous = end
             key = hash_tokens(full_tokens[:end])
-            entry = self.get(key)
+            entry = self.get((model, key))
             if entry is None:
                 missing.append(key)
                 continue
@@ -119,6 +147,10 @@ class DecodeHeadCache:
             covered[start - 1 : end - 1] = True
         uncovered = np.flatnonzero((np.asarray(weights) > 0) & ~covered)
         if uncovered.size:
-            cause = f"no recorded heads for hashes {missing}" if missing else f"not covered by {TURN_ENDS_KEY}"
+            cause = (
+                f"no heads recorded for model {model} at hashes {missing}"
+                if missing
+                else f"not covered by {TURN_ENDS_KEY}"
+            )
             raise ValueError(f"Positive-weight target positions {uncovered[:8].tolist()} have no decode head: {cause}")
         return ids.ravel().tolist(), logprobs.ravel().tolist()

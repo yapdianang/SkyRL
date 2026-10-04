@@ -15,7 +15,7 @@ from skyrl.backends.utils import (
 from skyrl.tinker import types
 from skyrl.tinker.config import EngineConfig
 from skyrl.tinker.db_models import FutureDB, RequestStatus
-from skyrl.tinker.decode_heads import DecodeHeadCache
+from skyrl.tinker.decode_heads import DecodeHeadCache, sampling_model
 from skyrl.utils.log import logger
 from skyrl.utils.storage import download_and_unpack
 
@@ -177,7 +177,11 @@ class ExternalInferenceClient:
             lp = choice["logprobs"]
             if record_topk:
                 self.decode_heads.record(
-                    prompt_tokens, choice["token_ids"], lp["token_logprobs"], lp.get("top_logprobs")
+                    sampling_model(model_id, base_model),
+                    prompt_tokens,
+                    choice["token_ids"],
+                    lp["token_logprobs"],
+                    lp.get("top_logprobs"),
                 )
             sequences.append(
                 types.GeneratedSequence(

@@ -18,7 +18,7 @@ from skyrl.backends.utils import (
 from skyrl.tinker import types
 from skyrl.tinker.config import EngineConfig
 from skyrl.tinker.db_models import EngineStateDB, RequestStatus
-from skyrl.tinker.decode_heads import DecodeHeadCache
+from skyrl.tinker.decode_heads import DecodeHeadCache, sampling_model
 from skyrl.tinker.external_future_store import ExternalFutureStore
 from skyrl.tinker.proto_serialization import serialize_sample_output
 from skyrl.utils.log import logger
@@ -249,7 +249,9 @@ class SkyRLTrainInferenceForwardingClient:
             logprobs = lp.get("token_logprobs") or []
             decode_logprobs = convert_vllm_decode_logprobs(tokens, logprobs, lp.get("top_logprobs"), decode_topk)
             if record_topk:
-                self.decode_heads.record(prompt_tokens, tokens, logprobs, lp.get("top_logprobs"))
+                self.decode_heads.record(
+                    sampling_model(model_id, base_model), prompt_tokens, tokens, logprobs, lp.get("top_logprobs")
+                )
             # vLLM occasionally returns None for logprobs under load; zero-fill so
             # RL advantage computation doesn't see a ragged shape.
             if not logprobs and tokens:

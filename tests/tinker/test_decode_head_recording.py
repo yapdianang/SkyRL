@@ -38,7 +38,8 @@ def sample_request(topk_logprobs=0, **sampling):
     )
 
 
-async def forward(forwarder, request, decode_heads, body=VLLM_BODY):
+async def forward(forwarder, request, decode_heads, body=VLLM_BODY, model_id=""):
+    """Forward one sample, from the base model unless model_id names an adapter (SkyRL-Train forwarding only)."""
     payloads = []
     if forwarder == "external":
 
@@ -54,7 +55,7 @@ async def forward(forwarder, request, decode_heads, body=VLLM_BODY):
     client = object.__new__(SkyRLTrainInferenceForwardingClient)
     client.decode_heads = decode_heads
     client._get_session = lambda: _AiohttpSession(payloads, body)
-    result = await client._forward("http://vllm", request, "", base_model="model")
+    result = await client._forward("http://vllm", request, model_id, base_model=None if model_id else "model")
     return payloads[0], result
 
 
@@ -77,7 +78,7 @@ async def test_record_then_lookup_with_unchanged_response(forwarder):
         assert result.sequences[0].topk_logprobs is None
     assert baseline_payload["logprobs"] in (1, True) and "return_tokens_as_token_ids" not in baseline_payload
     assert payload["logprobs"] == 2 and payload["return_tokens_as_token_ids"] is True
-    prompt_length, ids, logprobs = cache.get(trajectory_hash_tokens([1, 2, 99, 11]))
+    prompt_length, ids, logprobs = cache.get(("base:model", trajectory_hash_tokens([1, 2, 99, 11])))
     assert prompt_length == 2
     np.testing.assert_array_equal(ids, np.array([[10, 11], [10, 11]], dtype=np.int32))
     np.testing.assert_array_equal(logprobs, np.array([[-0.1, -0.2], [-0.1, -0.2]], dtype=np.float32))
@@ -88,7 +89,7 @@ async def test_record_then_lookup_with_unchanged_response(forwarder):
     payload, result = await forward(forwarder, sample_request(topk_logprobs=1), cache)
     assert payload["logprobs"] == 2
     assert result.sequences[0].topk_logprobs == [[(10, -0.1)], [(10, -0.1)]]
-    assert cache.get(hash_tokens([1, 2, 99, 11]))[1].shape == (2, 2)
+    assert cache.get(("base:model", hash_tokens([1, 2, 99, 11])))[1].shape == (2, 2)
 
     # Heads from a modified sampling distribution are not recorded.
     cache = DecodeHeadCache(k=2, max_bytes=1 << 20)
@@ -100,13 +101,52 @@ def test_lru_eviction_by_byte_cap():
     entry_bytes = 2 * 3 * 4 * 2  # ids int32 + logprobs float32, [2, 3] each
     cache = DecodeHeadCache(k=3, max_bytes=2 * entry_bytes)
     heads = np.zeros((2, 3), dtype=np.int32), np.zeros((2, 3), dtype=np.float32)
-    cache.put([1, 2, 3], 1, *heads)
-    cache.put([1, 2, 4], 1, *heads)
-    assert cache.get(hash_tokens([1, 2, 3])) is not None  # now most recently used
-    cache.put([1, 2, 5], 1, *heads)
-    assert cache.get(hash_tokens([1, 2, 4])) is None
-    assert cache.get(hash_tokens([1, 2, 3])) is not None and cache.get(hash_tokens([1, 2, 5])) is not None
+    cache.put("m", [1, 2, 3], 1, *heads)
+    cache.put("m", [1, 2, 4], 1, *heads)
+    assert cache.get(("m", hash_tokens([1, 2, 3]))) is not None  # now most recently used
+    cache.put("m", [1, 2, 5], 1, *heads)
+    assert cache.get(("m", hash_tokens([1, 2, 4]))) is None
+    assert cache.get(("m", hash_tokens([1, 2, 3]))) is not None and cache.get(("m", hash_tokens([1, 2, 5]))) is not None
     assert cache.evictions == 1 and cache.nbytes == 2 * entry_bytes
+
+
+@pytest.mark.asyncio
+async def test_adapters_sampling_identical_tokens_keep_their_own_heads():
+    other = json.loads(json.dumps(VLLM_BODY))
+    other["choices"][0]["logprobs"]["top_logprobs"] = [
+        {"token_id:99": -4.0, "token_id:20": -0.3, "token_id:21": -0.4},
+        {"token_id:11": -0.2, "token_id:20": -0.3},
+    ]
+    cache = DecodeHeadCache(k=2, max_bytes=1 << 20)
+    await forward("skyrl_train", sample_request(), cache, model_id="run-a")
+    await forward("skyrl_train", sample_request(), cache, body=other, model_id="run-b")
+    full, weights = [1, 2, 99, 11], [0.0, 1.0, 1.0]
+    assert cache.place("run-a", full, [4], weights, 2)[0][2:] == [10, 11, 10, 11]
+    assert cache.place("run-b", full, [4], weights, 2)[0][2:] == [20, 21, 11, 20]
+    assert not cache.overwrites
+
+    # The same adapter sampling the same tokens again replaces its heads (last writer wins) and is counted.
+    await forward("skyrl_train", sample_request(), cache, body=other, model_id="run-a")
+    assert cache.place("run-a", full, [4], weights, 2)[0][2:] == [20, 21, 11, 20]
+    assert cache.overwrites == {"run-a": 1} and cache.records == {"run-a": 2, "run-b": 1}
+    assert cache.stats()["models"]["run-a"] == {"records": 2, "overwrites": 1}
+
+    # Neither another training model nor a base-model sample of the same tokens serves this lookup.
+    await forward("skyrl_train", sample_request(), cache)
+    with pytest.raises(ValueError, match="no heads recorded for model run-c"):
+        cache.place("run-c", full, [4], weights, 2)
+
+
+@pytest.mark.asyncio
+async def test_decode_head_stats_route():
+    cache = DecodeHeadCache(k=2, max_bytes=1 << 20)
+    cache.put("run-a", [1, 2], 1, np.zeros((1, 2), np.int32), np.zeros((1, 2), np.float32))
+    stats = await api.decode_heads_stats(
+        SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(decode_heads=cache)))
+    )
+    assert stats["models"] == {"run-a": {"records": 1, "overwrites": 0}} and stats["entries"] == 1
+    with pytest.raises(api.HTTPException):
+        await api.decode_heads_stats(SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(decode_heads=None))))
 
 
 # Turn 1: prompt [1, 2, 3], sampled [4, 5]. Tool output [6, 7, 8]. Turn 2: sampled [9, 10, 11].
@@ -118,8 +158,8 @@ K = 2
 def two_turn_cache(record_turn_1=True):
     cache = DecodeHeadCache(k=3, max_bytes=1 << 20)
     if record_turn_1:
-        cache.put(FULL[:5], 3, np.array([[40, 41, 42], [50, 51, 52]], np.int32), -np.ones((2, 3), np.float32))
-    cache.put(FULL, 8, np.arange(90, 99, dtype=np.int32).reshape(3, 3), -2 * np.ones((3, 3), np.float32))
+        cache.put("model", FULL[:5], 3, np.array([[40, 41, 42], [50, 51, 52]], np.int32), -np.ones((2, 3), np.float32))
+    cache.put("model", FULL, 8, np.arange(90, 99, dtype=np.int32).reshape(3, 3), -2 * np.ones((3, 3), np.float32))
     return cache
 
 
@@ -169,7 +209,7 @@ def fwd_bwd_stub(cache, datums, *body_args):
 
 async def resolved_request(cache, datums, *body_args):
     request, _ = await api._read_forward_backward_request(fwd_bwd_stub(cache, datums, *body_args))
-    api._resolve_turn_ends(request.forward_backward_input, cache)
+    api._resolve_turn_ends(request.forward_backward_input, cache, request.model_id)
     return request
 
 
@@ -241,7 +281,7 @@ async def test_comparison_draws_are_recorded_as_their_histogram(forwarder, leave
     payload, _ = await forward(forwarder, sample_request(temperature=0.7, top_k=5), cache, body)
     assert payload["logprobs"] == 16 and payload["return_tokens_as_token_ids"] is True
 
-    ids, logprobs = cache.place([1, 2, 99, 11], [4], [0.0, 1.0, 1.0], 16)
+    ids, logprobs = cache.place("base:model", [1, 2, 99, 11], [4], [0.0, 1.0, 1.0], 16)
     for row, sampled, row_draws in zip((1, 2), (99, 11), draws):
         head_ids = np.asarray(ids).reshape(3, 16)[row]
         head_logprobs = np.asarray(logprobs, dtype=np.float32).reshape(3, 16)[row]
@@ -258,7 +298,7 @@ async def test_comparison_draws_are_recorded_as_their_histogram(forwarder, leave
 def test_top_k_logprobs_are_not_recorded_as_comparisons():
     cache = DecodeHeadCache(k=2, max_bytes=1 << 20, comparisons=True)
     top_logprobs = VLLM_BODY["choices"][0]["logprobs"]["top_logprobs"]
-    cache.record([1, 2], [99, 11], [-4.0, -0.2], top_logprobs)
+    cache.record("m", [1, 2], [99, 11], [-4.0, -0.2], top_logprobs)
     assert cache.nbytes == 0
 
 
@@ -266,7 +306,7 @@ def comparison_cache():
     cache = DecodeHeadCache(k=16, max_bytes=1 << 20, comparisons=True)
     for start, end in ((3, 5), (8, 11)):
         ids = np.arange(16 * (end - start), dtype=np.int32).reshape(-1, 16)
-        cache.put(FULL[:end], start, ids, np.full(ids.shape, -np.log(16), dtype=np.float32))
+        cache.put("model", FULL[:end], start, ids, np.full(ids.shape, -np.log(16), dtype=np.float32))
     return cache
 
 

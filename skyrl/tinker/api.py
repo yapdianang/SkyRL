@@ -1532,8 +1532,8 @@ async def _read_forward_backward_request(request: Request) -> tuple[ForwardBackw
         raise FastAPIRequestValidationError(e.errors())
 
 
-def _resolve_turn_ends(fb_input: ForwardBackwardInput, decode_heads: DecodeHeadCache | None) -> None:
-    """Replace each datum's score_centering_turn_ends with the recorded decode heads, in place."""
+def _resolve_turn_ends(fb_input: ForwardBackwardInput, decode_heads: DecodeHeadCache | None, model_id: str) -> None:
+    """Replace each datum's score_centering_turn_ends with the heads recorded for model_id's samples, in place."""
     comparisons = (fb_input.loss_fn_config or {}).get(COMPARISONS_KEY, 0)
     uses_turn_ends = [TURN_ENDS_KEY in datum.loss_fn_inputs for datum in fb_input.data]
     if not any(uses_turn_ends):
@@ -1564,7 +1564,9 @@ def _resolve_turn_ends(fb_input: ForwardBackwardInput, decode_heads: DecodeHeadC
         weights = inputs["weights"].data if "weights" in inputs else [1.0] * len(targets)
         if len(targets) != len(model_tokens) or len(weights) != len(targets) or targets[:-1] != model_tokens[1:]:
             raise ValueError("target_tokens and weights must align with model_input tokens shifted by one")
-        ids, logprobs = decode_heads.place(model_tokens + targets[-1:], inputs.pop(TURN_ENDS_KEY).data, weights, int(k))
+        ids, logprobs = decode_heads.place(
+            model_id, model_tokens + targets[-1:], inputs.pop(TURN_ENDS_KEY).data, weights, int(k)
+        )
         inputs["topk_token_ids"] = TensorData(data=ids)
         inputs["topk_logprobs"] = TensorData(data=logprobs)
 
@@ -1574,7 +1576,7 @@ async def forward_backward(request: Request, session: AsyncSession = Depends(get
     """Compute and accumulate gradients (or run forward-only when the proto body asks for it)."""
     req, forward_only = await _read_forward_backward_request(request)
     try:
-        _resolve_turn_ends(req.forward_backward_input, getattr(request.app.state, "decode_heads", None))
+        _resolve_turn_ends(req.forward_backward_input, getattr(request.app.state, "decode_heads", None), req.model_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     async with request.app.state.db_write_lock:
@@ -1862,6 +1864,15 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         request_id=str(request_id),
         sample_sequence_ids=[uuid4().hex for _ in range(request.num_samples)],
     )
+
+
+@app.get("/api/v1/decode_heads")
+async def decode_heads_stats(request: Request):
+    """Recorded decode heads and same-model overwrites per sampling model, to measure overwrite incidence."""
+    decode_heads = getattr(request.app.state, "decode_heads", None)
+    if decode_heads is None:
+        raise HTTPException(status_code=404, detail="Decode heads are not recorded on this server")
+    return decode_heads.stats()
 
 
 @app.get("/api/v1/get_server_capabilities", response_model=GetServerCapabilitiesResponse)
