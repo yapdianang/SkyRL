@@ -171,7 +171,7 @@ class DecodeHeadCache:
         k: int,
         comparisons: int = 0,
         leave_in: bool = False,
-    ) -> tuple[list[int], list[float]]:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """Return flat [n, k] heads aligned with targets full_tokens[1:]; turn rows go to targets [start - 1, end - 1).
 
         ``comparisons`` selects histograms of that many recorded draws instead of the top-k heads.
@@ -215,4 +215,4 @@ class DecodeHeadCache:
                 else f"not covered by {TURN_ENDS_KEY}"
             )
             raise ValueError(f"Positive-weight target positions {uncovered[:8].tolist()} have no decode head: {cause}")
-        return ids.ravel().tolist(), logprobs.ravel().tolist()
+        return ids.ravel(), logprobs.ravel()

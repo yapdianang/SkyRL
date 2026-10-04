@@ -695,9 +695,12 @@ class ModelInput(BaseModel):
 
 class TensorData(BaseModel):
     data: list[int] | list[float]
+    # Set only by the server for recorded heads; see types.TensorData.
+    packed: str | None = None
+    dtype: Literal["int32", "float32"] | None = None
 
     def to_types(self) -> types.TensorData:
-        return types.TensorData(data=self.data)
+        return types.TensorData(data=self.data, packed=self.packed, dtype=self.dtype)
 
 
 class Datum(BaseModel):
@@ -1590,8 +1593,9 @@ def _resolve_turn_ends(fb_input: ForwardBackwardInput, decode_heads: DecodeHeadC
             comparisons=int(comparisons),
             leave_in=bool(leave_in),
         )
-        inputs["topk_token_ids"] = TensorData(data=ids)
-        inputs["topk_logprobs"] = TensorData(data=logprobs)
+        token_ids, head_logprobs = types.TensorData.pack(ids, "int32"), types.TensorData.pack(logprobs, "float32")
+        inputs["topk_token_ids"] = TensorData(data=[], packed=token_ids.packed, dtype="int32")
+        inputs["topk_logprobs"] = TensorData(data=[], packed=head_logprobs.packed, dtype="float32")
 
 
 @app.post("/api/v1/forward_backward", response_model=FutureResponse)

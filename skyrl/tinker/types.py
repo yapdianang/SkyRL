@@ -5,10 +5,12 @@
 
 from __future__ import annotations
 
+import base64
 from enum import Enum
 from typing import Annotated, Any, Literal, TypedDict
 from urllib.parse import urlparse
 
+import numpy as np
 from pydantic import Base64Bytes, BaseModel, Discriminator, Field
 
 
@@ -141,7 +143,20 @@ class RenderedModelInput(BaseModel):
 
 
 class TensorData(BaseModel):
-    data: list[int] | list[float]
+    data: list[int] | list[float] = Field(default_factory=list)
+    # Base64 of a little-endian array of ``dtype`` that replaces ``data``; per-number JSON is too slow for heads.
+    packed: str | None = None
+    dtype: Literal["int32", "float32"] | None = None
+
+    def values(self) -> list[int] | list[float] | np.ndarray:
+        """``data``, or the decoded ``packed`` array."""
+        if self.packed is None:
+            return self.data
+        return np.frombuffer(base64.b64decode(self.packed), dtype=np.dtype(self.dtype).newbyteorder("<"))
+
+    @classmethod
+    def pack(cls, array: np.ndarray, dtype: Literal["int32", "float32"]) -> TensorData:
+        return cls(packed=base64.b64encode(np.ascontiguousarray(array, dtype="<" + dtype[0] + "4").tobytes()).decode(), dtype=dtype)
 
 
 class LossFnInputs(BaseModel):
@@ -319,8 +334,9 @@ class PreparedModelPassBatch(BaseModel):
     all_token_weights: list[list[float]]
     all_sampling_logprobs: list[list[float]]
     all_advantages: list[list[float]]
-    all_topk_token_ids: list[list[int]] = Field(default_factory=list)
-    all_topk_logprobs: list[list[float]] = Field(default_factory=list)
+    # Lists or decoded numpy arrays (packed heads).
+    all_topk_token_ids: list[Any] = Field(default_factory=list)
+    all_topk_logprobs: list[Any] = Field(default_factory=list)
     all_reference_logprobs: list[list[float]] = Field(default_factory=list)
     all_values: list[list[float]]
     all_returns: list[list[float]]

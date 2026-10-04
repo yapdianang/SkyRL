@@ -129,13 +129,13 @@ async def test_adapters_sampling_identical_tokens_keep_their_own_heads():
     await forward("skyrl_train", sample_request(), cache, model_id="run-a")
     await forward("skyrl_train", sample_request(), cache, body=other, model_id="run-b")
     full, weights = [1, 2, 99, 11], [0.0, 1.0, 1.0]
-    assert cache.place("run-a", full, [4], weights, 2)[0][2:] == [10, 11, 10, 11]
-    assert cache.place("run-b", full, [4], weights, 2)[0][2:] == [20, 21, 11, 20]
+    assert cache.place("run-a", full, [4], weights, 2)[0][2:].tolist() == [10, 11, 10, 11]
+    assert cache.place("run-b", full, [4], weights, 2)[0][2:].tolist() == [20, 21, 11, 20]
     assert not cache.overwrites
 
     # The same adapter sampling the same tokens again replaces its heads (last writer wins) and is counted.
     await forward("skyrl_train", sample_request(), cache, body=other, model_id="run-a")
-    assert cache.place("run-a", full, [4], weights, 2)[0][2:] == [20, 21, 11, 20]
+    assert cache.place("run-a", full, [4], weights, 2)[0][2:].tolist() == [20, 21, 11, 20]
     assert cache.overwrites == {"run-a": 1} and cache.records == {"run-a": 2, "run-b": 1}
     assert cache.stats()["models"]["run-a"] == {"records": 2, "overwrites": 1}
 
@@ -303,7 +303,10 @@ async def test_one_server_records_top_k_heads_and_comparison_draws(forwarder):
     full, weights = [1, 2, 99, 11], [0.0, 1.0, 1.0]
 
     # Top-k heads are those of a top-k-only (-sc2) server; the comparison histograms are the draws.
-    assert cache.place("base:model", full, [4], weights, 2) == top_k_only.place("base:model", full, [4], weights, 2)
+    for got, expected in zip(
+        cache.place("base:model", full, [4], weights, 2), top_k_only.place("base:model", full, [4], weights, 2)
+    ):
+        assert got.tolist() == expected.tolist()
     assert histograms(cache, full, [4], weights, 16)[1:] == [Counter(row) for row in DRAWS]
 
     # A modified sampling law records only the draws, which come from the processed law; greedy records nothing.
@@ -414,8 +417,8 @@ async def test_each_request_selects_its_heads_and_mismatches_fail():
         # The keys stay for the backend, which reports the weighted NLL like native stabilized_reinforce.
         assert request.forward_backward_input.loss_fn_config == loss_fn_config
         inputs = request.forward_backward_input.data[0].loss_fn_inputs
-        row_ids = inputs["topk_token_ids"].data[2 * k : 3 * k]
-        row_logprobs = inputs["topk_logprobs"].data[2 * k : 3 * k]
+        row_ids = inputs["topk_token_ids"].to_types().values()[2 * k : 3 * k].tolist()
+        row_logprobs = inputs["topk_logprobs"].to_types().values()[2 * k : 3 * k].tolist()
         assert contains <= {i for i, lp in zip(row_ids, row_logprobs) if lp > COMPARISON_PAD_LOGPROB}
 
     for cache, loss_fn_config, message in (
