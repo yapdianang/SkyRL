@@ -1,6 +1,7 @@
 """Decode top-k heads recorded at sampling time and looked up by token sequence for score centering."""
 
 import hashlib
+import threading
 import time
 from collections import Counter, OrderedDict
 
@@ -53,7 +54,8 @@ class DecodeHeadCache:
     forward_backward looks heads up under its own model id, so runs on different LoRA adapters of one service
     never read each other's heads; base-model samples are never served to a training model. A later sample of
     the same model and tokens replaces the earlier entry (last writer wins) and counts as an overwrite.
-    Forwarding tasks write and forward_backward reads on the API event loop, so there is no lock.
+    Forwarding tasks write on the API event loop and forward_backward reads from a worker thread, so get and put
+    hold a lock.
     """
 
     def __init__(self, k: int, max_bytes: int, comparisons: int = 0):
@@ -68,6 +70,7 @@ class DecodeHeadCache:
         self._entries: OrderedDict[tuple[str, str], tuple] = OrderedDict()
         self._last_eviction_log = float("-inf")
         self._last_overwrite_log = float("-inf")
+        self._lock = threading.Lock()
 
     def _records(self, sampling_params) -> tuple[bool, bool]:
         """Top-k heads describe the sampling law only for unmodified sampling; draws come from the processed law."""
@@ -115,38 +118,40 @@ class DecodeHeadCache:
     def put(
         self, model: str, tokens: list[int], prompt_length: int, *arrays: np.ndarray, comparisons: bool = False
     ) -> None:
-        key = (model, (_COMPARISONS_ENTRY if comparisons else "") + hash_tokens(tokens))
-        self.records[model] += 1
-        if (old := self._entries.pop(key, None)) is not None:
-            self.nbytes -= sum(array.nbytes for array in old[1:])
-            self.overwrites[model] += 1
+        with self._lock:
+            key = (model, (_COMPARISONS_ENTRY if comparisons else "") + hash_tokens(tokens))
+            self.records[model] += 1
+            if (old := self._entries.pop(key, None)) is not None:
+                self.nbytes -= sum(array.nbytes for array in old[1:])
+                self.overwrites[model] += 1
+                now = time.monotonic()
+                if now - self._last_overwrite_log >= _EVICTION_LOG_INTERVAL_SECONDS:
+                    self._last_overwrite_log = now
+                    logger.warning(
+                        f"Decode head overwrites by model so far: {dict(self.overwrites)} of {dict(self.records)}"
+                    )
+            self._entries[key] = (prompt_length, *arrays)
+            self.nbytes += sum(array.nbytes for array in arrays)
+            evicted = 0
+            while self.nbytes > self.max_bytes:
+                _, old = self._entries.popitem(last=False)
+                self.nbytes -= sum(array.nbytes for array in old[1:])
+                evicted += 1
+            self.evictions += evicted
             now = time.monotonic()
-            if now - self._last_overwrite_log >= _EVICTION_LOG_INTERVAL_SECONDS:
-                self._last_overwrite_log = now
+            if evicted and now - self._last_eviction_log >= _EVICTION_LOG_INTERVAL_SECONDS:
+                self._last_eviction_log = now
                 logger.warning(
-                    f"Decode head overwrites by model so far: {dict(self.overwrites)} of {dict(self.records)}"
+                    f"Decode head cache evicted {self.evictions} entries in total "
+                    f"(cap {self.max_bytes} bytes, {len(self._entries)} entries held)"
                 )
-        self._entries[key] = (prompt_length, *arrays)
-        self.nbytes += sum(array.nbytes for array in arrays)
-        evicted = 0
-        while self.nbytes > self.max_bytes:
-            _, old = self._entries.popitem(last=False)
-            self.nbytes -= sum(array.nbytes for array in old[1:])
-            evicted += 1
-        self.evictions += evicted
-        now = time.monotonic()
-        if evicted and now - self._last_eviction_log >= _EVICTION_LOG_INTERVAL_SECONDS:
-            self._last_eviction_log = now
-            logger.warning(
-                f"Decode head cache evicted {self.evictions} entries in total "
-                f"(cap {self.max_bytes} bytes, {len(self._entries)} entries held)"
-            )
 
     def get(self, key: tuple[str, str]) -> tuple | None:
-        entry = self._entries.get(key)
-        if entry is not None:
-            self._entries.move_to_end(key)
-        return entry
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is not None:
+                self._entries.move_to_end(key)
+            return entry
 
     def stats(self) -> dict:
         models = sorted(self.records)

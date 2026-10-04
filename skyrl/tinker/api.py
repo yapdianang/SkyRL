@@ -478,11 +478,14 @@ async def create_future(
     session: AsyncSession,
     request_type: types.RequestType,
     model_id: str | None,
-    request_data: BaseModel,
+    request_data: BaseModel | dict,
     seq_id: int | None = None,
 ) -> int:
-    """Create a future, returning the original request_id when an SDK request is retried."""
-    serialized_request = request_data.model_dump(mode="json")
+    """Create a future, returning the original request_id when an SDK request is retried.
+
+    A dict ``request_data`` is already serialized with ``model_dump(mode="json")``.
+    """
+    serialized_request = request_data if isinstance(request_data, dict) else request_data.model_dump(mode="json")
 
     async def existing_request_id() -> int | None:
         """The request_id already recorded for this (model_id, seq_id), if there is one."""
@@ -1593,8 +1596,15 @@ def _resolve_turn_ends(fb_input: ForwardBackwardInput, decode_heads: DecodeHeadC
 async def forward_backward(request: Request, session: AsyncSession = Depends(get_session)):
     """Compute and accumulate gradients (or run forward-only when the proto body asks for it)."""
     req, forward_only = await _read_forward_backward_request(request)
+    decode_heads = getattr(request.app.state, "decode_heads", None)
+
+    def resolve_and_serialize() -> dict:
+        _resolve_turn_ends(req.forward_backward_input, decode_heads, req.model_id)
+        return req.forward_backward_input.to_types().model_dump(mode="json")
+
     try:
-        _resolve_turn_ends(req.forward_backward_input, getattr(request.app.state, "decode_heads", None), req.model_id)
+        # Recorded heads make a long-context batch tens of millions of numbers; heartbeats must not wait on them.
+        request_data = await asyncio.to_thread(resolve_and_serialize)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     async with request.app.state.db_write_lock:
@@ -1603,7 +1613,7 @@ async def forward_backward(request: Request, session: AsyncSession = Depends(get
             session=session,
             request_type=types.RequestType.FORWARD if forward_only else types.RequestType.FORWARD_BACKWARD,
             model_id=req.model_id,
-            request_data=req.forward_backward_input.to_types(),
+            request_data=request_data,
             seq_id=req.seq_id,
         )
         await session.commit()
