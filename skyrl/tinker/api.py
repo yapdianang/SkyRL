@@ -744,6 +744,8 @@ class ForwardBackwardInput(BaseModel):
         "reinforce_score_centered": {
             "score_centering_k",
             "importance_cap",
+            "importance_band_low",
+            "importance_band_high",
             "kl_loss_coef",
             "importance_sampling",
             "center_scores",
