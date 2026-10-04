@@ -668,6 +668,8 @@ class MegatronModelWrapper:
             if score_centered:
                 config_overrides.pop("score_centering_k", None)
                 config_overrides.pop("importance_cap", None)
+                config_overrides.pop("importance_band_low", None)
+                config_overrides.pop("importance_band_high", None)
                 config_overrides.pop("importance_sampling", None)
                 config_overrides.pop("center_scores", None)
                 config_overrides.pop("score_centering_comparisons", None)
