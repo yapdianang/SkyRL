@@ -34,8 +34,11 @@ class _AiohttpResponse:
     status = 200
     headers = {}
 
+    def __init__(self, body=None):
+        self.body = VLLM_BODY if body is None else body
+
     async def read(self):
-        return json.dumps(VLLM_BODY).encode()
+        return json.dumps(self.body).encode()
 
     async def __aenter__(self):
         return self
@@ -45,12 +48,13 @@ class _AiohttpResponse:
 
 
 class _AiohttpSession:
-    def __init__(self, payloads):
+    def __init__(self, payloads, body=None):
         self.payloads = payloads
+        self.body = body
 
     def post(self, url, json, headers):
         self.payloads.append(json)
-        return _AiohttpResponse()
+        return _AiohttpResponse(self.body)
 
 
 def sample_request(topk_logprobs=2, **sampling):

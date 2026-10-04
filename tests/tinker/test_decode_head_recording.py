@@ -1,15 +1,21 @@
 import hashlib
 import json
+from collections import Counter
 from types import SimpleNamespace
 
 import httpx
 import numpy as np
 import pytest
 import tinker.types as sdk_types
+import torch
 from tinker.proto.request_conv import forward_backward_request_to_proto
 
+from skyrl.backends.skyrl_train.patches.vllm.patch_stabilized_comparisons import (
+    encode_comparisons,
+)
+from skyrl.backends.utils import COMPARISON_PAD_LOGPROB
 from skyrl.tinker import api
-from skyrl.tinker.decode_heads import DecodeHeadCache, hash_tokens
+from skyrl.tinker.decode_heads import COMPARISONS_KEY, DecodeHeadCache, hash_tokens
 from skyrl.tinker.engine import prepare_model_pass_batch
 from skyrl.tinker.extra.external_inference import ExternalInferenceClient
 from skyrl.tinker.extra.skyrl_train_inference_forwarding import (
@@ -32,13 +38,13 @@ def sample_request(topk_logprobs=0, **sampling):
     )
 
 
-async def forward(forwarder, request, decode_heads):
+async def forward(forwarder, request, decode_heads, body=VLLM_BODY):
     payloads = []
     if forwarder == "external":
 
         def respond(http_request):
             payloads.append(json.loads(http_request.content))
-            return httpx.Response(200, json=VLLM_BODY)
+            return httpx.Response(200, json=body)
 
         client = object.__new__(ExternalInferenceClient)
         client.decode_heads = decode_heads
@@ -47,7 +53,7 @@ async def forward(forwarder, request, decode_heads):
         return payloads[0], result
     client = object.__new__(SkyRLTrainInferenceForwardingClient)
     client.decode_heads = decode_heads
-    client._get_session = lambda: _AiohttpSession(payloads)
+    client._get_session = lambda: _AiohttpSession(payloads, body)
     result = await client._forward("http://vllm", request, "", base_model="model")
     return payloads[0], result
 
@@ -117,7 +123,7 @@ def two_turn_cache(record_turn_1=True):
     return cache
 
 
-def fwd_bwd_body(datums) -> bytes:
+def fwd_bwd_body(datums, loss_fn="ppo_score_centered", loss_fn_config=None) -> bytes:
     request = sdk_types.ForwardBackwardRequest(
         model_id="model",
         seq_id=1,
@@ -132,8 +138,8 @@ def fwd_bwd_body(datums) -> bytes:
                 )
                 for inputs in datums
             ],
-            loss_fn="ppo_score_centered",
-            loss_fn_config={"score_centering_k": float(K)},
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config or {"score_centering_k": float(K)},
         ),
     )
     return forward_backward_request_to_proto(request).SerializeToString()
@@ -150,9 +156,9 @@ def datum_inputs(**extra):
     }
 
 
-def fwd_bwd_stub(cache, datums):
+def fwd_bwd_stub(cache, datums, *body_args):
     async def body():
-        return fwd_bwd_body(datums)
+        return fwd_bwd_body(datums, *body_args)
 
     return SimpleNamespace(
         headers={"content-type": api.PROTO_CONTENT_TYPE},
@@ -161,8 +167,8 @@ def fwd_bwd_stub(cache, datums):
     )
 
 
-async def resolved_request(cache, datums):
-    request, _ = await api._read_forward_backward_request(fwd_bwd_stub(cache, datums))
+async def resolved_request(cache, datums, *body_args):
+    request, _ = await api._read_forward_backward_request(fwd_bwd_stub(cache, datums, *body_args))
     api._resolve_turn_ends(request.forward_backward_input, cache)
     return request
 
@@ -209,3 +215,86 @@ async def test_batch_accepts_exactly_one_head_form():
         await resolved_request(two_turn_cache(), [turn_form, head_form])
     request = await resolved_request(two_turn_cache(), [head_form])
     assert request.forward_backward_input.data[0].loss_fn_inputs["topk_token_ids"].data == [0] * 20
+
+
+def comparison_body(sampled, sampled_logprobs, draws, k=16):
+    """vLLM's completion body for one sample under SKYRL_STABILIZED_COMPARISONS=k."""
+    ids, logprobs = encode_comparisons(torch.tensor(draws), torch.tensor(sampled), torch.tensor(sampled_logprobs), k, k)
+    # vLLM folds a position's columns, sampled token first, into a dict keyed by token id.
+    top_logprobs = [
+        {f"token_id:{token}": logprob for token, logprob in zip([s, *row_ids], [lp, *row_logprobs])}
+        for s, lp, row_ids, row_logprobs in zip(sampled, sampled_logprobs, ids.tolist(), logprobs.tolist())
+    ]
+    logprobs = {"token_logprobs": sampled_logprobs, "top_logprobs": top_logprobs}
+    return {"choices": [{"token_ids": sampled, "finish_reason": "stop", "logprobs": logprobs}]}
+
+
+@pytest.mark.parametrize("forwarder", ["external", "skyrl_train"])
+@pytest.mark.parametrize("leave_in", [False, True])
+@pytest.mark.asyncio
+async def test_comparison_draws_are_recorded_as_their_histogram(forwarder, leave_in):
+    # Leave-in drops one draw; the sampled token is the 16th. Token 11 is never drawn at position 2.
+    draws = [row[leave_in:] for row in ([99] * 5 + [10] * 7 + [12] * 4, [10] * 16)]
+    body = comparison_body([99, 11], [-1.5, -0.25], draws)
+    cache = DecodeHeadCache(k=16, max_bytes=1 << 20, comparisons=True)
+    # Draws come from the processed law, so a modified sampling distribution is recorded.
+    payload, _ = await forward(forwarder, sample_request(temperature=0.7, top_k=5), cache, body)
+    assert payload["logprobs"] == 16 and payload["return_tokens_as_token_ids"] is True
+
+    ids, logprobs = cache.place([1, 2, 99, 11], [4], [0.0, 1.0, 1.0], 16)
+    for row, sampled, row_draws in zip((1, 2), (99, 11), draws):
+        head_ids = np.asarray(ids).reshape(3, 16)[row]
+        head_logprobs = np.asarray(logprobs, dtype=np.float32).reshape(3, 16)[row]
+        drawn = head_logprobs > COMPARISON_PAD_LOGPROB
+        histogram = dict(zip(head_ids[drawn].tolist(), np.round(16 * np.exp(head_logprobs[drawn])).tolist()))
+        assert histogram == Counter(row_draws + [sampled] * leave_in)
+        assert len(set(head_ids.tolist())) == 16 and (head_logprobs[~drawn] == COMPARISON_PAD_LOGPROB).all()
+
+    cache = DecodeHeadCache(k=16, max_bytes=1 << 20, comparisons=True)
+    payload, _ = await forward(forwarder, sample_request(temperature=0.0), cache, body)
+    assert payload["logprobs"] in (1, True) and cache.nbytes == 0
+
+
+def test_top_k_logprobs_are_not_recorded_as_comparisons():
+    cache = DecodeHeadCache(k=2, max_bytes=1 << 20, comparisons=True)
+    top_logprobs = VLLM_BODY["choices"][0]["logprobs"]["top_logprobs"]
+    cache.record([1, 2], [99, 11], [-4.0, -0.2], top_logprobs)
+    assert cache.nbytes == 0
+
+
+def comparison_cache():
+    cache = DecodeHeadCache(k=16, max_bytes=1 << 20, comparisons=True)
+    for start, end in ((3, 5), (8, 11)):
+        ids = np.arange(16 * (end - start), dtype=np.int32).reshape(-1, 16)
+        cache.put(FULL[:end], start, ids, np.full(ids.shape, -np.log(16), dtype=np.float32))
+    return cache
+
+
+@pytest.mark.asyncio
+async def test_comparison_heads_need_the_matching_request_key():
+    datums = [datum_inputs(score_centering_turn_ends=([5, 11], "int64"))]
+    config = {"score_centering_k": 16.0, COMPARISONS_KEY: 16.0}
+    request = await resolved_request(comparison_cache(), datums, "reinforce_score_centered", config)
+    # The key stays for the backend, which then reports the weighted NLL like native stabilized_reinforce.
+    assert request.forward_backward_input.loss_fn_config == config
+    assert request.forward_backward_input.data[0].loss_fn_inputs["topk_token_ids"].data[2 * 16 : 3 * 16] == list(
+        range(16)
+    )
+
+    for cache, loss_fn_config, message in (
+        (comparison_cache(), {"score_centering_k": 16.0}, "records 16 comparison draws"),
+        (two_turn_cache(), {"score_centering_k": float(K), COMPARISONS_KEY: 16.0}, "records 0 comparison draws"),
+        (comparison_cache(), {"score_centering_k": 8.0, COMPARISONS_KEY: 16.0}, "truncate"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            await resolved_request(cache, datums, "reinforce_score_centered", loss_fn_config)
+    with pytest.raises(ValueError, match=f"{COMPARISONS_KEY} requires"):
+        await resolved_request(comparison_cache(), [datum_inputs()], "reinforce_score_centered", config)
+
+
+@pytest.mark.asyncio
+async def test_client_decode_topk_is_rejected_under_comparisons(monkeypatch):
+    monkeypatch.setattr(api, "SKYRL_STABILIZED_COMPARISONS", 16)
+    with pytest.raises(api.HTTPException) as error:
+        await api.asample(sample_request(topk_logprobs=2), SimpleNamespace(), session=None)
+    assert error.value.status_code == 400 and "comparison draws" in error.value.detail

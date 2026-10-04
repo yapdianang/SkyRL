@@ -1,5 +1,6 @@
 """Shared helper utilities for TinkerEngine backends."""
 
+import itertools
 import math
 import time
 from contextlib import contextmanager
@@ -104,6 +105,47 @@ def convert_vllm_decode_logprobs(
         # The completions API includes the sampled token even when its rank exceeds K.
         result.append(sorted(candidates, key=lambda item: item[1], reverse=True)[:topk])
     return result
+
+
+COMPARISON_PAD_LOGPROB = -1000.0
+
+
+def convert_vllm_comparison_heads(
+    token_ids: list[int],
+    raw_top_logprobs: list[dict[str, float]] | None,
+    k: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Heads [n, k] of each position's k comparison draws: the distinct drawn ids and log(count / k).
+
+    Under SKYRL_STABILIZED_COMPARISONS, vLLM lists each drawn id other than the sampled token with
+    log(count / k), so the sampled token's count is k minus the listed counts. Columns after the
+    distinct ids hold distinct unused ids at COMPARISON_PAD_LOGPROB, whose float32 probability is 0.
+    """
+    if raw_top_logprobs is None or len(raw_top_logprobs) != len(token_ids):
+        raise ValueError("comparison heads must align with generated tokens")
+    ids = np.empty((len(token_ids), k), dtype=np.int32)
+    logprobs = np.full((len(token_ids), k), COMPARISON_PAD_LOGPROB, dtype=np.float32)
+    for row, (sampled, top) in enumerate(zip(token_ids, raw_top_logprobs)):
+        if not top or f"token_id:{sampled}" not in top:
+            raise ValueError("vLLM returned no decode logprob for a sampled token")
+        counts = {}
+        for token, logprob in top.items():
+            if not token.startswith("token_id:") or not token[9:].isdigit():
+                raise ValueError("comparison heads require numeric vLLM token IDs")
+            if int(token[9:]) == sampled:
+                continue
+            count = k * math.exp(logprob)
+            if round(count) < 1 or abs(count - round(count)) > 1e-3:
+                raise ValueError(f"decode logprob {logprob} is not log(count / {k}); vLLM returned no comparison draws")
+            counts[int(token[9:])] = round(count)
+        counts[sampled] = k - sum(counts.values())
+        if counts[sampled] < 0:
+            raise ValueError(f"comparison counts exceed {k}")
+        drawn = [token for token, count in counts.items() if count]
+        unused = (token for token in itertools.count() if token not in counts)
+        ids[row] = drawn + [next(unused) for _ in range(k - len(drawn))]
+        logprobs[row, : len(drawn)] = np.log(np.array([counts[token] for token in drawn]) / k)
+    return ids, logprobs
 
 
 def pad_batch(sequences: list[list], max_length: int, dtype) -> np.ndarray:

@@ -94,6 +94,21 @@ SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES = int(os.environ.get("SKYRL_SCORE_CENTERI
 Byte cap of the recorded decode heads; the least recently used entries are evicted. Default 8 GiB.
 """
 
+SKYRL_STABILIZED_COMPARISONS = int(os.environ.get("SKYRL_STABILIZED_COMPARISONS") or 0)
+"""
+K comparison tokens drawn i.i.d. per generated token from the processed sampling distribution.
+vLLM engines return their histogram in place of decode top-k logprobs (this requires
+``logprobs_mode=processed_logprobs``), and the API server records it as K-wide decode heads.
+Set it on every node that runs vLLM engines and on the API server, with
+``SKYRL_SCORE_CENTERING_RECORD_TOPK`` equal to K. Default 0 disables.
+"""
+
+SKYRL_STABILIZED_LEAVE_IN = str(os.environ.get("SKYRL_STABILIZED_LEAVE_IN", "False")).lower() in ("true", "1", "yes")
+"""
+With ``SKYRL_STABILIZED_COMPARISONS=K``, vLLM draws K - 1 comparisons and counts the sampled token
+as the K-th. Set it on every node that runs vLLM engines. Default: False.
+"""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime Environment Exports
 # ─────────────────────────────────────────────────────────────────────────────

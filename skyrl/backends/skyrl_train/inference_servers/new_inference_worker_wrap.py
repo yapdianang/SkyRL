@@ -125,6 +125,12 @@ from skyrl.backends.skyrl_train.patches.vllm_kimi_k25_lora import (  # noqa: E40
 )
 
 apply_kimi_k25_lora_patch()
+# A no-op unless SKYRL_STABILIZED_COMPARISONS is set; samplers are built after this module loads.
+from skyrl.backends.skyrl_train.patches.vllm.patch_stabilized_comparisons import (  # noqa: E402
+    apply_stabilized_comparisons_patch,
+)
+
+apply_stabilized_comparisons_patch()
 
 
 VLLM_NEW_INFERENCE_WORKER_EXTENSION_CLS = f"{__name__}.NewInferenceWorkerWrap"

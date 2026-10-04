@@ -6,10 +6,15 @@ from collections import OrderedDict
 
 import numpy as np
 
-from skyrl.backends.utils import convert_vllm_decode_logprobs
+from skyrl.backends.utils import (
+    convert_vllm_comparison_heads,
+    convert_vllm_decode_logprobs,
+)
 from skyrl.utils.log import logger
 
 TURN_ENDS_KEY = "score_centering_turn_ends"
+# loss_fn_config key: the number of comparison draws the client expects in each head, or 0 for top-k heads.
+COMPARISONS_KEY = "score_centering_comparisons"
 _EVICTION_LOG_INTERVAL_SECONDS = 60.0
 
 
@@ -24,8 +29,10 @@ class DecodeHeadCache:
     Forwarding tasks write and forward_backward reads on the API event loop, so there is no lock.
     """
 
-    def __init__(self, k: int, max_bytes: int):
+    def __init__(self, k: int, max_bytes: int, comparisons: bool = False):
         self.k = k
+        # Heads are histograms of k comparison draws (SKYRL_STABILIZED_COMPARISONS), not the sampler's top-k.
+        self.comparisons = comparisons
         self.max_bytes = max_bytes
         self.nbytes = 0
         self.evictions = 0
@@ -33,7 +40,12 @@ class DecodeHeadCache:
         self._last_eviction_log = float("-inf")
 
     def record_topk(self, sampling_params) -> int:
-        """vLLM logprobs describe the sampling distribution only when sampling does not modify it."""
+        """vLLM logprobs describe the sampling distribution only when sampling does not modify it.
+
+        Comparisons are drawn from the processed distribution, which a greedy sample is not drawn from.
+        """
+        if self.comparisons:
+            return self.k if sampling_params.temperature > 0 else 0
         unmodified = sampling_params.temperature == 1 and sampling_params.top_p == 1 and sampling_params.top_k == -1
         return self.k if unmodified else 0
 
@@ -41,12 +53,15 @@ class DecodeHeadCache:
         if not tokens:
             return
         try:
-            heads = np.asarray(convert_vllm_decode_logprobs(tokens, token_logprobs, raw_top_logprobs, self.k))
+            if self.comparisons:
+                ids, logprobs = convert_vllm_comparison_heads(tokens, raw_top_logprobs, self.k)
+            else:
+                heads = np.asarray(convert_vllm_decode_logprobs(tokens, token_logprobs, raw_top_logprobs, self.k))
+                ids, logprobs = heads[..., 0].astype(np.int32), heads[..., 1].astype(np.float32)
         except ValueError as e:
             # The sample still succeeds; training on it fails later with the missing hash.
             logger.warning(f"Decode heads not recorded: {e}")
             return
-        ids, logprobs = heads[..., 0].astype(np.int32), heads[..., 1].astype(np.float32)
         self.put(prompt_tokens + tokens, len(prompt_tokens), ids, logprobs)
 
     def put(self, tokens: list[int], prompt_length: int, ids: np.ndarray, logprobs: np.ndarray) -> None:
@@ -81,6 +96,8 @@ class DecodeHeadCache:
         """Return flat [n, k] heads aligned with targets full_tokens[1:]; turn rows go to targets [start - 1, end - 1)."""
         if k > self.k:
             raise ValueError(f"score_centering_k={k} exceeds the recorded k={self.k}")
+        if self.comparisons and k != self.k:
+            raise ValueError(f"score_centering_k={k} would truncate histograms of {self.k} comparison draws")
         n = len(full_tokens) - 1
         ids = np.zeros((n, k), dtype=np.int32)
         logprobs = np.zeros((n, k), dtype=np.float32)

@@ -167,8 +167,13 @@ def score_centered_reinforce_loss(
     kl_coef=0.0,
     importance_sampling=True,
     center_scores=True,
+    nll_value=False,
 ):
-    """Top-k TIS + score centering, arXiv:2609.20807 equation 12."""
+    """Top-k TIS + score centering, arXiv:2609.20807 equation 12.
+
+    nll_value keeps the centering in the gradient only, so the loss value is -A * logp plus the K2 term,
+    as native stabilized_reinforce reports it.
+    """
     active = weights > 0
     logp = logp[active]
     old, advantages = old.detach()[active], advantages.detach()[active]
@@ -185,6 +190,8 @@ def score_centered_reinforce_loss(
             residual = head_q.exp() - (q_tail / p_tail)[:, None] * p
             sampled_weight = torch.ones_like(logp)
     correction = (residual * head_p).sum(-1) if center_scores else 0.0
+    if nll_value:
+        correction = correction - correction.detach()
     loss = -advantages * (sampled_weight * logp - correction)
     if kl_coef:
         loss = loss + kl_coef * 0.5 * (logp - reference.detach()[active]).square()

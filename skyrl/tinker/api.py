@@ -36,6 +36,7 @@ from skyrl.env_vars import (
     SKYRL_HTTP_CONNECTION_LIMIT,
     SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES,
     SKYRL_SCORE_CENTERING_RECORD_TOPK,
+    SKYRL_STABILIZED_COMPARISONS,
 )
 from skyrl.tinker import types
 from skyrl.tinker.config import (
@@ -57,7 +58,7 @@ from skyrl.tinker.db_models import (
     enable_sqlite_wal,
     get_async_database_url,
 )
-from skyrl.tinker.decode_heads import TURN_ENDS_KEY, DecodeHeadCache
+from skyrl.tinker.decode_heads import COMPARISONS_KEY, TURN_ENDS_KEY, DecodeHeadCache
 from skyrl.tinker.external_future_store import ExternalFutureStore
 from skyrl.tinker.extra import (
     ExternalInferenceClient,
@@ -386,17 +387,20 @@ async def lifespan(app: FastAPI):
 
     # Forwarded samples bypass the engine subprocess, so this process records their heads for forward_backward.
     app.state.decode_heads = None
+    if SKYRL_STABILIZED_COMPARISONS and SKYRL_STABILIZED_COMPARISONS != SKYRL_SCORE_CENTERING_RECORD_TOPK:
+        raise RuntimeError("SKYRL_STABILIZED_COMPARISONS requires an equal SKYRL_SCORE_CENTERING_RECORD_TOPK")
     if SKYRL_SCORE_CENTERING_RECORD_TOPK:
         if app.state.external_inference_client is None:
             raise RuntimeError("SKYRL_SCORE_CENTERING_RECORD_TOPK requires sample forwarding in the API server")
         app.state.decode_heads = DecodeHeadCache(
-            SKYRL_SCORE_CENTERING_RECORD_TOPK, SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES
+            SKYRL_SCORE_CENTERING_RECORD_TOPK,
+            SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES,
+            comparisons=bool(SKYRL_STABILIZED_COMPARISONS),
         )
         app.state.external_inference_client.decode_heads = app.state.decode_heads
-        logger.info(
-            f"Recording decode top-{SKYRL_SCORE_CENTERING_RECORD_TOPK} heads "
-            f"(cap {SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES} bytes)"
-        )
+        k = SKYRL_SCORE_CENTERING_RECORD_TOPK
+        heads = f"{k}-draw comparison histograms" if SKYRL_STABILIZED_COMPARISONS else f"top-{k} heads"
+        logger.info(f"Recording decode {heads} (cap {SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES} bytes)")
 
     # Build subprocess command with engine config parameters.
     parent_cmd = psutil.Process(os.getppid()).cmdline()
@@ -733,6 +737,7 @@ class ForwardBackwardInput(BaseModel):
             "kl_loss_coef",
             "importance_sampling",
             "center_scores",
+            COMPARISONS_KEY,
         },
         "gspo": {"clip_low_threshold", "clip_high_threshold"},
         "cispo": {"clip_low_threshold", "clip_high_threshold"},
@@ -1529,8 +1534,11 @@ async def _read_forward_backward_request(request: Request) -> tuple[ForwardBackw
 
 def _resolve_turn_ends(fb_input: ForwardBackwardInput, decode_heads: DecodeHeadCache | None) -> None:
     """Replace each datum's score_centering_turn_ends with the recorded decode heads, in place."""
+    comparisons = (fb_input.loss_fn_config or {}).get(COMPARISONS_KEY, 0)
     uses_turn_ends = [TURN_ENDS_KEY in datum.loss_fn_inputs for datum in fb_input.data]
     if not any(uses_turn_ends):
+        if comparisons:
+            raise ValueError(f"{COMPARISONS_KEY} requires {TURN_ENDS_KEY}")
         return
     if not all(uses_turn_ends) or any(
         key in datum.loss_fn_inputs for datum in fb_input.data for key in ("topk_token_ids", "topk_logprobs")
@@ -1538,6 +1546,10 @@ def _resolve_turn_ends(fb_input: ForwardBackwardInput, decode_heads: DecodeHeadC
         raise ValueError(f"Each datum of a batch must supply {TURN_ENDS_KEY}, or none may")
     if decode_heads is None:
         raise ValueError(f"{TURN_ENDS_KEY} requires SKYRL_SCORE_CENTERING_RECORD_TOPK on the server")
+    # A client and a server that disagree on the head form would train on the wrong centering.
+    recorded = decode_heads.k if decode_heads.comparisons else 0
+    if comparisons != recorded:
+        raise ValueError(f"{COMPARISONS_KEY}={comparisons:g} but the server records {recorded} comparison draws")
     if fb_input.loss_fn not in ("ppo_score_centered", "reinforce_score_centered"):
         raise ValueError(f"{TURN_ENDS_KEY} requires a score-centered loss")
     k = (fb_input.loss_fn_config or {}).get("score_centering_k", 0)
@@ -1779,6 +1791,11 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         raise HTTPException(
             status_code=400,
             detail="sampling_session_id must not contain ':' (the routing-key delimiter)",
+        )
+    if request.topk_logprobs and SKYRL_STABILIZED_COMPARISONS:
+        raise HTTPException(
+            status_code=400,
+            detail="decode logprobs carry comparison draws under SKYRL_STABILIZED_COMPARISONS, not the top-k",
         )
 
     base_model, model_path = await get_sampling_model(request, req, session)

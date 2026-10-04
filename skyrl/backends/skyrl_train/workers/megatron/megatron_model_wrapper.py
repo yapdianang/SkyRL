@@ -670,6 +670,7 @@ class MegatronModelWrapper:
                 config_overrides.pop("importance_cap", None)
                 config_overrides.pop("importance_sampling", None)
                 config_overrides.pop("center_scores", None)
+                config_overrides.pop("score_centering_comparisons", None)
             new_loss_config = OmegaConf.merge(OmegaConf.create(asdict(loss_config)), OmegaConf.create(config_overrides))
             # NOTE: users can provide a custom loss config class, so we need to use the same class after applying overrides
             loss_config = type(loss_config).from_dict_config(new_loss_config)
@@ -838,6 +839,8 @@ class MegatronModelWrapper:
                         kl_coef=(loss_fn_config or {}).get("kl_loss_coef", 0.0),
                         importance_sampling=(loss_fn_config or {}).get("importance_sampling", True),
                         center_scores=(loss_fn_config or {}).get("center_scores", True),
+                        # The stabilized_reinforce replica reports native's forward loss, the weighted NLL.
+                        nll_value=bool((loss_fn_config or {}).get("score_centering_comparisons", 0)),
                     )
                     loss_metrics = {}
                 else:
