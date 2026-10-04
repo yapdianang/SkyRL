@@ -87,7 +87,11 @@ def _build_packed_targets(
     cu_padded = packed_seq_params.cu_seqlens_q_padded.to(device=sequences.device, dtype=torch.long)
     total_padded_tokens = int(cu_padded[-1].item())
 
-    targets = torch.zeros((total_padded_tokens,), dtype=sequences.dtype, device=sequences.device)
+    targets = torch.zeros(
+        (total_padded_tokens, *sequences.shape[2:]),
+        dtype=sequences.dtype,
+        device=sequences.device,
+    )
     if sub_seq_lengths is not None:
         cu_padded_cpu = cu_padded.detach().cpu().tolist()
         seg_idx = 0
@@ -647,15 +651,26 @@ class MegatronModelWrapper:
 
         # Resolve loss function
         resolved_loss_name = loss_fn if loss_fn is not None else self.cfg.algorithm.policy_loss_type
+        score_centered = resolved_loss_name in {"ppo_score_centered", "reinforce_score_centered"}
+        if score_centered and not self._fused_lm_head:
+            raise ValueError("ppo_score_centered requires fused_lm_head_logprob=True")
+        if score_centered and self.cfg.algorithm.enable_sample_support_replay:
+            raise ValueError("Score-centered losses do not support enable_sample_support_replay")
         if loss_fn is not None:
-            current_loss_fn = PolicyLossRegistry.get(loss_fn)
+            current_loss_fn = PolicyLossRegistry.get("regular" if score_centered else loss_fn)
         else:
             current_loss_fn = self.policy_loss_fn
 
         # Build config for loss function, applying any overrides
         loss_config = self.cfg.algorithm
         if loss_fn_config:
-            new_loss_config = OmegaConf.merge(OmegaConf.create(asdict(loss_config)), OmegaConf.create(loss_fn_config))
+            config_overrides = dict(loss_fn_config)
+            if score_centered:
+                config_overrides.pop("score_centering_k", None)
+                config_overrides.pop("importance_cap", None)
+                config_overrides.pop("importance_sampling", None)
+                config_overrides.pop("center_scores", None)
+            new_loss_config = OmegaConf.merge(OmegaConf.create(asdict(loss_config)), OmegaConf.create(config_overrides))
             # NOTE: users can provide a custom loss config class, so we need to use the same class after applying overrides
             loss_config = type(loss_config).from_dict_config(new_loss_config)
 
@@ -694,6 +709,29 @@ class MegatronModelWrapper:
             # temperature normalization (the fused path applies it inside the op)
             if temperature != 1.0 and not fused_lm_head:
                 logits.div_(temperature)
+
+            scoring_targets = sequences
+            if score_centered:
+                heads = data["topk_token_ids"]
+                if (heads < 0).any() or (
+                    heads >= lm_head_weight.shape[0] * mpu.get_tensor_model_parallel_world_size()
+                ).any():
+                    raise ValueError("Score-centering token ID outside the model vocabulary")
+                # Head row t describes the same prediction as target_tokens[t].
+                head_targets = torch.zeros(
+                    (*sequences.shape, heads.shape[-1]),
+                    dtype=heads.dtype,
+                    device=heads.device,
+                )
+                head_targets[:, -num_actions:] = heads
+                scoring_targets = torch.cat((sequences.unsqueeze(-1), head_targets), dim=-1)
+                if packed_seq_params is not None:
+                    packed_targets = _build_packed_targets(
+                        scoring_targets,
+                        data["attention_mask"],
+                        packed_seq_params,
+                        sub_seq_lengths=data.get("sub_seq_lengths_list"),
+                    )
 
             shard_vocab_size = lm_head_weight.shape[0] if fused_lm_head else logits.shape[-1]
             support_entropy = None
@@ -740,7 +778,7 @@ class MegatronModelWrapper:
                 token_logprobs = from_parallel_hidden_to_logprobs(
                     logits,  # decoder hidden states [B, S, H]
                     lm_head_weight,
-                    sequences,
+                    scoring_targets,
                     vocab_start_index=fused_vocab_start,
                     vocab_end_index=fused_vocab_end,
                     tp_group=tp_grp,
@@ -779,15 +817,52 @@ class MegatronModelWrapper:
 
             action_log_probs = token_logprobs[:, -num_actions:]
 
-            # policy loss should be calculated based on the selected token logprobs
-            policy_loss, loss_metrics = current_loss_fn(
-                action_log_probs,
-                old_action_log_probs,
-                advantages,
-                config=loss_config,
-                loss_mask=loss_mask,
-                rollout_logprobs=rollout_action_logprobs,
-            )
+            if score_centered:
+                from skyrl.backends.skyrl_train.score_centering import (
+                    score_centered_ppo_loss,
+                    score_centered_reinforce_loss,
+                )
+
+                head_log_probs = action_log_probs[..., 1:]
+                action_log_probs = action_log_probs[..., 0]
+                if resolved_loss_name == "reinforce_score_centered":
+                    policy_loss = score_centered_reinforce_loss(
+                        action_log_probs,
+                        old_action_log_probs,
+                        advantages,
+                        head_log_probs,
+                        data["topk_logprobs"],
+                        loss_mask,
+                        (loss_fn_config or {}).get("importance_cap", 2.0),
+                        reference=data.get("reference_logprobs"),
+                        kl_coef=(loss_fn_config or {}).get("kl_loss_coef", 0.0),
+                        importance_sampling=(loss_fn_config or {}).get("importance_sampling", True),
+                        center_scores=(loss_fn_config or {}).get("center_scores", True),
+                    )
+                    loss_metrics = {}
+                else:
+                    policy_loss, loss_metrics = score_centered_ppo_loss(
+                        action_log_probs,
+                        old_action_log_probs,
+                        advantages,
+                        head_log_probs,
+                        data["topk_logprobs"],
+                        loss_mask,
+                        loss_config.eps_clip_low,
+                        loss_config.eps_clip_high,
+                        reference=data.get("reference_logprobs"),
+                        kl_coef=(loss_fn_config or {}).get("kl_loss_coef", 0.0),
+                        center_scores=(loss_fn_config or {}).get("center_scores", True),
+                    )
+            else:
+                policy_loss, loss_metrics = current_loss_fn(
+                    action_log_probs,
+                    old_action_log_probs,
+                    advantages,
+                    config=loss_config,
+                    loss_mask=loss_mask,
+                    rollout_logprobs=rollout_action_logprobs,
+                )
 
             # Decoupled MTP / draft loss: soft-CE distillation of the detached-input MTP head against
             # the policy's own next-token distribution (full-vocab, or top-k when mtp_loss_topk is
@@ -985,7 +1060,7 @@ class MegatronModelWrapper:
             else:
                 entropy_loss_term = torch.tensor(0.0, device=logits.device)
 
-            if loss_config.use_kl_loss:
+            if loss_config.use_kl_loss and not score_centered:
                 kl_loss = compute_approx_kl(
                     action_log_probs,
                     base_action_log_probs,

@@ -11,7 +11,10 @@ import orjson
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from skyrl.backends.renderer import render_model_input
-from skyrl.backends.utils import convert_vllm_prompt_logprobs
+from skyrl.backends.utils import (
+    convert_vllm_decode_logprobs,
+    convert_vllm_prompt_logprobs,
+)
 from skyrl.tinker import types
 from skyrl.tinker.config import EngineConfig
 from skyrl.tinker.db_models import EngineStateDB, RequestStatus
@@ -123,7 +126,9 @@ class SkyRLTrainInferenceForwardingClient:
 
         await self.external_future_store.complete(request_id, result, status)
 
-    async def _forward_with_retry(self, sample_req, model_id: str, *, base_model: str | None) -> bytes:
+    async def _forward_with_retry(
+        self, sample_req, model_id: str, *, base_model: str | None
+    ) -> bytes | types.SampleOutput:
         # Retry only failures where the request demonstrably did not execute:
         # connect-phase errors and 5xx rejections from the router. Read and
         # write failures are ambiguous: vLLM may still be executing the
@@ -155,7 +160,9 @@ class SkyRLTrainInferenceForwardingClient:
                 "the SKYRL_FORWARDING_INFERENCE_TIMEOUT_SEC environment variable."
             ) from e
 
-    async def _forward(self, proxy_url: str, sample_req, model_id: str, *, base_model: str | None) -> bytes:
+    async def _forward(
+        self, proxy_url: str, sample_req, model_id: str, *, base_model: str | None
+    ) -> bytes | types.SampleOutput:
         # model_id matches the LoRA name registered with vLLM during
         # save_weights_for_sampler; base_model is used for non-LoRA sampling.
         model_name = base_model if base_model else model_id
@@ -178,6 +185,10 @@ class SkyRLTrainInferenceForwardingClient:
             "stream": False,
             "return_token_ids": True,
         }
+        decode_topk = getattr(sample_req, "topk_logprobs", 0) or 0
+        if decode_topk:
+            payload["logprobs"] = decode_topk
+            payload["return_tokens_as_token_ids"] = True
         # vLLM's `prompt_logprobs` is an int: 0 returns just the prompt tokens'
         # own logprobs, k>0 also returns the top-k per position.
         topk_prompt_logprobs = getattr(sample_req, "topk_prompt_logprobs", 0) or 0
@@ -227,11 +238,12 @@ class SkyRLTrainInferenceForwardingClient:
                 logger.warning("Requested prompt logprobs but vLLM /v1/completions returned none")
             prompt_logprobs, topk = convert_vllm_prompt_logprobs(prompt_tokens, raw, topk=topk_prompt_logprobs)
 
-        sequences = []
+        sequences, decode_heads = [], []
         for choice in result.get("choices", []):
             tokens = choice.get("token_ids", [])
             lp = choice.get("logprobs") or {}
             logprobs = lp.get("token_logprobs") or []
+            decode_logprobs = convert_vllm_decode_logprobs(tokens, logprobs, lp.get("top_logprobs"), decode_topk)
             # vLLM occasionally returns None for logprobs under load; zero-fill so
             # RL advantage computation doesn't see a ragged shape.
             if not logprobs and tokens:
@@ -241,7 +253,18 @@ class SkyRLTrainInferenceForwardingClient:
             finish_reason = choice.get("finish_reason")
             stop_reason = "stop" if finish_reason in ("stop", "stop_token") else "length"
             sequences.append((stop_reason, tokens, logprobs))
+            decode_heads.append(decode_logprobs)
 
+        if decode_topk:
+            # SampledSequence has no decode top-k field, so this result is stored and served as JSON.
+            return types.SampleOutput(
+                sequences=[
+                    types.GeneratedSequence(stop_reason=reason, tokens=ids, logprobs=lps, topk_logprobs=heads)
+                    for (reason, ids, lps), heads in zip(sequences, decode_heads)
+                ],
+                prompt_logprobs=prompt_logprobs,
+                topk_prompt_logprobs=topk,
+            )
         # Encode straight to the proto wire form the SDK retrieves; no pydantic
         # model or JSON text is built for the result.
         return serialize_sample_output(sequences, prompt_logprobs, topk)

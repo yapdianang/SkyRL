@@ -33,6 +33,7 @@ from skyrl.backends.skyrl_train.workers.worker_utils import (
     MINIBATCH_ROLLOUT_LOGPROB_DIFF_MEAN_KEY,
     MINIBATCH_ROLLOUT_LOGPROB_DIFF_MIN_KEY,
     MINIBATCH_ROLLOUT_LOGPROB_DIFF_SQ_MEAN_KEY,
+    SCORE_CENTERING_METRICS_PREFIX,
 )
 from skyrl.env_vars import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl.tinker import types
@@ -235,6 +236,9 @@ class SkyRLTrainBackend(AbstractBackend):
             "all_token_weights",
             "all_sampling_logprobs",
             "all_advantages",
+            "all_topk_token_ids",
+            "all_topk_logprobs",
+            "all_reference_logprobs",
             "all_values",
             "all_returns",
             "all_rollout_logprobs",
@@ -858,6 +862,15 @@ class SkyRLTrainBackend(AbstractBackend):
                 placeholder = torch.empty(0, *ref.shape[1:], dtype=ref.dtype, device=ref.device)
                 batch_dict[mm_key] = TensorList([v if v is not None else placeholder for v in values])
 
+        if {"ppo_score_centered", "reinforce_score_centered"}.intersection(prepared_batch.all_loss_fns):
+            from skyrl.backends.skyrl_train.score_centering import (
+                add_score_centering_inputs,
+            )
+
+            if self._cfg.trainer.strategy != "megatron":
+                raise ValueError("ppo_score_centered requires the Megatron fused LM-head backend")
+            add_score_centering_inputs(batch_dict, prepared_batch, max_response_len)
+
         batch = TrainingInputBatch(batch_dict)
         batch.metadata = {"response_length": max_response_len}
         return batch
@@ -951,7 +964,9 @@ class SkyRLTrainBackend(AbstractBackend):
             if not key.startswith(LOSS_METRICS_PREFIX):
                 continue
             name = key[len(LOSS_METRICS_PREFIX) :]
-            if name.endswith("_max"):
+            if key.startswith(SCORE_CENTERING_METRICS_PREFIX):
+                reduction = "sum"
+            elif name.endswith("_max"):
                 reduction = "max"
             elif name.endswith("_min"):
                 reduction = "min"

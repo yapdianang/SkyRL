@@ -141,6 +141,9 @@ def prepare_model_pass_batch(
     all_model_ids = []
     all_sampling_logprobs = []
     all_advantages = []
+    all_topk_token_ids = []
+    all_topk_logprobs = []
+    all_reference_logprobs = []
     all_values = []
     all_returns = []
     all_rollout_logprobs = []
@@ -161,6 +164,9 @@ def prepare_model_pass_batch(
             all_token_weights.append(loss_fn_inputs.weights.data)
             all_sampling_logprobs.append(loss_fn_inputs.logprobs.data)
             all_advantages.append(loss_fn_inputs.advantages.data)
+            all_topk_token_ids.append(loss_fn_inputs.topk_token_ids.data)
+            all_topk_logprobs.append(loss_fn_inputs.topk_logprobs.data)
+            all_reference_logprobs.append(loss_fn_inputs.reference_logprobs.data)
             all_values.append(loss_fn_inputs.values.data)
             all_returns.append(loss_fn_inputs.returns.data)
             all_rollout_logprobs.append(loss_fn_inputs.rollout_logprobs.data)
@@ -176,6 +182,9 @@ def prepare_model_pass_batch(
         all_token_weights=all_token_weights,
         all_sampling_logprobs=all_sampling_logprobs,
         all_advantages=all_advantages,
+        all_topk_token_ids=all_topk_token_ids,
+        all_topk_logprobs=all_topk_logprobs,
+        all_reference_logprobs=all_reference_logprobs,
         all_values=all_values,
         all_returns=all_returns,
         all_rollout_logprobs=all_rollout_logprobs,

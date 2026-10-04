@@ -313,6 +313,9 @@ class FusedLinearChunkedDistributedLogprob(torch.autograd.Function):
         tp_group: torch.distributed.ProcessGroup,
         inference_only: bool = False,
     ) -> torch.Tensor:
+        single_target = target.ndim == 2
+        if single_target:
+            target = target.unsqueeze(-1)
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
         masked_target = target - vocab_start_index
         masked_target[target_mask] = 0
@@ -335,7 +338,7 @@ class FusedLinearChunkedDistributedLogprob(torch.autograd.Function):
             )
 
             log_probs = _compute_distributed_log_softmax(logits, group=tp_group)
-            log_probs = torch.gather(log_probs, -1, masked_target[:, chunk_start:chunk_end].unsqueeze(-1)).squeeze(-1)
+            log_probs = torch.gather(log_probs, -1, masked_target[:, chunk_start:chunk_end])
             log_probs[target_mask[:, chunk_start:chunk_end]] = 0.0
             all_log_probs.append(log_probs)
 
@@ -355,10 +358,11 @@ class FusedLinearChunkedDistributedLogprob(torch.autograd.Function):
 
         if not inference_only:
             ctx.save_for_backward(hidden, weight, target_mask, masked_target)
+            ctx.single_target = single_target
             ctx.chunk_size = chunk_size
             ctx.tp_group = tp_group
 
-        return log_probs
+        return log_probs.squeeze(-1) if single_target else log_probs
 
     @staticmethod
     def backward(
@@ -366,13 +370,14 @@ class FusedLinearChunkedDistributedLogprob(torch.autograd.Function):
         *grad_outputs: torch.Tensor,
     ) -> tuple[Optional[torch.Tensor], ...]:
         grad_output = grad_outputs[0]
+        if ctx.single_target:
+            grad_output = grad_output.unsqueeze(-1)
         hidden, weight, target_mask, masked_target = ctx.saved_tensors
         chunk_size = ctx.chunk_size
         tp_group = ctx.tp_group
 
         partition_vocab_size = int(weight.shape[0])
         hidden_size = int(weight.shape[1])
-        batch_size = int(hidden.shape[0])
         seq_size = int(hidden.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
@@ -386,7 +391,6 @@ class FusedLinearChunkedDistributedLogprob(torch.autograd.Function):
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
             chunk_end = min(seq_size, (chunk_idx + 1) * chunk_size)
-            chunk_len = chunk_end - chunk_start
 
             h_chunk = hidden[:, chunk_start:chunk_end, :]
             logits = torch.matmul(h_chunk.to(weight.dtype), weight.t()).to(dtype=torch.float32)
@@ -400,17 +404,8 @@ class FusedLinearChunkedDistributedLogprob(torch.autograd.Function):
             chunk_masked_target = masked_target[:, chunk_start:chunk_end]
             chunk_grad_output = grad_output[:, chunk_start:chunk_end]
 
-            row = torch.arange(batch_size, device=softmax_output.device).view(-1, 1).expand(-1, chunk_len).reshape(-1)
-            col = torch.arange(chunk_len, device=softmax_output.device).expand(batch_size, -1).reshape(-1)
-            flat_idx = (row * chunk_len + col) * partition_vocab_size
-
-            valid_mask = ~chunk_target_mask
-            flat_chosen = flat_idx.masked_select(valid_mask.reshape(-1)) + chunk_masked_target.masked_select(valid_mask)
-
-            grad_logits = softmax_output.neg_()
-            grad_logits.mul_(chunk_grad_output.unsqueeze(-1))
-            grad_output_selected = chunk_grad_output.masked_select(valid_mask)
-            grad_logits.view(-1).scatter_add_(0, flat_chosen, grad_output_selected)
+            grad_logits = softmax_output.neg_() * chunk_grad_output.sum(-1, keepdim=True)
+            grad_logits.scatter_add_(-1, chunk_masked_target, chunk_grad_output.masked_fill(chunk_target_mask, 0))
 
             grad_logits = grad_logits.to(dtype=weight.dtype)  # [B, cs, V//TP]
 
@@ -447,7 +442,8 @@ def _fused_lm_head_logprob_apply(
     uses ``FusedLinearLogprobTriton`` when CUDA + triton are available and
     otherwise warns and falls back to torch. Both return TP-combined ``[B, S]``.
     """
-    if backend == "triton":
+    # Sparse heads share one projection/normalizer in the PyTorch implementation.
+    if backend == "triton" and target.ndim == 2:
         try:
             from skyrl.backends.skyrl_train.distributed.megatron.fused_linear_logprob_triton import (
                 TRITON_AVAILABLE,
@@ -740,11 +736,11 @@ def from_parallel_hidden_to_logprobs(
     """
     if temperature != 1.0:
         lm_head_weight = lm_head_weight / temperature
-    target = target.roll(shifts=-1, dims=-1)
+    target = target.roll(shifts=-1, dims=1)
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
     pad_len = hidden.shape[1] * cp_size - target.shape[1]
     if pad_len > 0:
-        target = torch.nn.functional.pad(target, (0, pad_len), value=0)
+        target = torch.nn.functional.pad(target, (0, 0, 0, pad_len) if target.ndim == 3 else (0, pad_len), value=0)
 
     cp_rank = torch.distributed.get_rank(cp_group)
     target = _get_tokens_on_this_cp_rank(target, cp_rank, cp_size, seq_dim=1)
@@ -819,7 +815,9 @@ def from_parallel_hidden_to_logprobs_packed_sequences(
         cp_rank_for_token, local_indices = _packed_cp_rank_and_local_indices(
             cu_seqlens_padded, seq_indices, seq_offsets, seq_lens_padded, cp_size
         )
-        rolled_targets = torch.empty(target.shape[0] // cp_size, dtype=target.dtype, device=target.device)
+        rolled_targets = torch.empty(
+            (target.shape[0] // cp_size, *target.shape[1:]), dtype=target.dtype, device=target.device
+        )
         current_rank_mask = cp_rank_for_token == cp_rank
         rolled_targets[local_indices[current_rank_mask]] = rolled_targets_full[current_rank_mask]
     else:
@@ -844,13 +842,13 @@ def from_parallel_hidden_to_logprobs_packed_sequences(
     ).contiguous()
 
     probs = probs.squeeze(0)
-    if probs.dim() != 1:
-        raise ValueError(f"Expected probs to be 1D after squeezing, but got shape {probs.shape}.")
 
     if cp_size > 1:
         probs = allgather_cp_sharded_packed_tensor(probs, cu_seqlens_padded, cp_group)
 
-    out_logprobs = torch.zeros((batch_size, unpacked_seqlen - 1), dtype=probs.dtype, device=probs.device)
+    out_logprobs = torch.zeros(
+        (batch_size, unpacked_seqlen - 1, *probs.shape[1:]), dtype=probs.dtype, device=probs.device
+    )
     _, _, seq_indices, seq_offsets, seq_lens_padded = _packed_sequence_indices(
         cu_seqlens_padded, probs.shape[0], probs.device
     )
@@ -1247,7 +1245,9 @@ class AllGatherPackedCPTensor(torch.autograd.Function):
         )
 
         local_rank_mask = cp_rank_for_token == cp_rank
-        grad_input = torch.zeros(ctx.local_tokens, dtype=grad_output.dtype, device=grad_output.device)
+        grad_input = torch.zeros(
+            (ctx.local_tokens, *grad_output.shape[1:]), dtype=grad_output.dtype, device=grad_output.device
+        )
         grad_input[local_indices[local_rank_mask]] = grad_output[local_rank_mask]
         return grad_input, None, None
 

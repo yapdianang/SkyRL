@@ -90,6 +90,13 @@ class TestReduceMetrics:
         with pytest.raises(AssertionError, match="No metrics for key"):
             reduce_metrics(metrics)
 
+    def test_reduce_metrics_sums_score_centering_metrics(self):
+        """Score-centering token counts and sums add across micro-batches."""
+        metrics = {"loss_metrics/score_centering/action_tokens": [2.0, 3.0], "loss_metrics/clip_ratio": [0.1, 0.3]}
+        result = reduce_metrics(metrics)
+        assert result["loss_metrics/score_centering/action_tokens"] == 5.0
+        assert result["loss_metrics/clip_ratio"] == pytest.approx(0.2)
+
 
 class TestAllReduceMetrics:
     @pytest.mark.parametrize("sum_loss_metrics", [True, False])
@@ -210,3 +217,13 @@ class TestAllReduceMetrics:
         assert result["is_ratio_min"] == 0.05  # 0.1 / 2 (min op)
         assert result["policy_loss"] == 6.0  # sum op
         assert result["entropy"] == 1.0  # 0.5 * 2 (mean op)
+
+    @pytest.mark.parametrize("sum_loss_metrics", [True, False])
+    def test_all_reduce_metrics_sums_score_centering_metrics(self, sum_loss_metrics):
+        strategy = MagicMock()
+        strategy.all_reduce.side_effect = lambda d, op, group=None: dict(d)
+        metrics = {"loss_metrics/score_centering/q_tail_sum": 1.5, "entropy": 0.5}
+        all_reduce_metrics(metrics, strategy, sum_loss_metrics=sum_loss_metrics)
+        ops = {kwargs["op"]: set(args[0]) for args, kwargs in strategy.all_reduce.call_args_list}
+        assert ops["sum"] == {"loss_metrics/score_centering/q_tail_sum"}
+        assert ops["mean"] == {"entropy"}

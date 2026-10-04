@@ -127,6 +127,38 @@ def test_rollout_logprobs_length_mismatch_rejected():
         )
 
 
+def test_score_centered_batch_left_pads_heads_and_normalizes_per_request():
+    data = [
+        types.Datum(
+            model_input=types.ModelInput(chunks=[types.EncodedTextChunk(tokens=tokens)]),
+            loss_fn_inputs=types.LossFnInputs(
+                target_tokens=types.TensorData(data=targets),
+                weights=types.TensorData(data=weights),
+                advantages=types.TensorData(data=[1.0] * len(targets)),
+                logprobs=types.TensorData(data=[-1.0] * len(targets)),
+                topk_token_ids=types.TensorData(data=heads),
+                topk_logprobs=types.TensorData(data=[-1.0, -2.0] * len(targets)),
+            ),
+        )
+        for tokens, targets, weights, heads in (
+            ([1, 2, 3], [2, 3, 4], [0.0, 1.0, 1.0], [7, 8, 9, 10, 11, 12]),
+            ([1, 2], [2, 5], [1.0, 1.0], [13, 14, 15, 16]),
+        )
+    ]
+    request = types.ForwardBackwardInput(
+        data=data, loss_fn="ppo_score_centered", loss_fn_config={"score_centering_k": 2.0, "center_scores": 0.0}
+    )
+    backend = _fake_backend()
+    backend._cfg = SimpleNamespace(trainer=SimpleNamespace(strategy="megatron"))
+    batch = skyrl_train_backend.SkyRLTrainBackend._to_training_batch(
+        backend, prepare_model_pass_batch({"req1": ("model1", request)}), role="policy"
+    )
+    # Inactive rows are zeroed; padding sits on the left like the other response fields.
+    assert batch["topk_token_ids"].tolist() == [[[0, 0], [9, 10], [11, 12]], [[0, 0], [13, 14], [15, 16]]]
+    assert batch["topk_logprobs"].shape == (2, 3, 2)
+    assert batch["loss_mask"].tolist() == [[0.0, 0.25, 0.25], [0.0, 0.25, 0.25]]
+
+
 def test_mixed_batch_rejected():
     """`rollout_logprobs` is all-or-nothing per batch: a datum that omits it while a batch-mate
     provides it is a client inconsistency and fails loudly instead of silently losing correction."""
@@ -220,6 +252,18 @@ def test_extract_metrics_forwards_loss_metrics_family():
     assert metrics["is_ratio_min:min"] == 0.5
     # Non-loss_metrics keys keep their existing handling.
     assert metrics["total_loss:sum"] == 1.0
+
+
+def test_extract_metrics_sums_score_centering_metrics():
+    data = {
+        "final_loss": 1.0,
+        "loss_metrics/score_centering/action_tokens": 7.0,
+        "loss_metrics/score_centering/head_kl_sum": 0.25,
+    }
+    metrics = skyrl_train_backend.SkyRLTrainBackend._extract_metrics(_fake_backend(), data)
+    assert metrics["score_centering/action_tokens:sum"] == 7.0
+    assert metrics["score_centering/head_kl_sum:sum"] == 0.25
+    assert "score_centering/action_tokens:mean" not in metrics
 
 
 def test_extract_metrics_without_loss_metrics_is_unchanged():

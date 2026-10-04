@@ -1,5 +1,6 @@
 """Shared helper utilities for TinkerEngine backends."""
 
+import math
 import time
 from contextlib import contextmanager
 
@@ -74,6 +75,35 @@ def convert_vllm_prompt_logprobs(
         for pos_dict in raw_prompt_logprobs[: len(prompt_token_ids)]
     ]
     return prompt_logprobs, topk_prompt_logprobs
+
+
+def convert_vllm_decode_logprobs(
+    token_ids: list[int],
+    token_logprobs: list[float],
+    raw_top_logprobs: list[dict[str, float]] | None,
+    topk: int,
+) -> list[list[tuple[int, float]]] | None:
+    """Keep exactly K decode candidates, excluding an out-of-head sampled token."""
+    if not topk:
+        return None
+    if raw_top_logprobs is None or len(raw_top_logprobs) != len(token_ids):
+        raise ValueError("decode topk_logprobs must align with generated tokens")
+    if len(token_logprobs) != len(token_ids) or any(not math.isfinite(lp) for lp in token_logprobs):
+        raise ValueError("decode topk_logprobs requires finite sampled-token logprobs")
+    result = []
+    for row in raw_top_logprobs:
+        if not row or len(row) < topk:
+            raise ValueError("vLLM returned fewer decode logprobs than requested")
+        candidates = []
+        for token, logprob in row.items():
+            if not token.startswith("token_id:") or not token[9:].isdigit():
+                raise ValueError("decode topk_logprobs requires numeric vLLM token IDs")
+            if not math.isfinite(logprob):
+                raise ValueError("vLLM returned nonfinite decode logprobs")
+            candidates.append((int(token[9:]), logprob))
+        # The completions API includes the sampled token even when its rank exceeds K.
+        result.append(sorted(candidates, key=lambda item: item[1], reverse=True)[:topk])
+    return result
 
 
 def pad_batch(sequences: list[list], max_length: int, dtype) -> np.ndarray:

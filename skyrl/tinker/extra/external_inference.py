@@ -8,7 +8,10 @@ from cloudpathlib import AnyPath
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from skyrl.backends.renderer import render_model_input
-from skyrl.backends.utils import convert_vllm_prompt_logprobs
+from skyrl.backends.utils import (
+    convert_vllm_decode_logprobs,
+    convert_vllm_prompt_logprobs,
+)
 from skyrl.tinker import types
 from skyrl.tinker.config import EngineConfig
 from skyrl.tinker.db_models import FutureDB, RequestStatus
@@ -134,6 +137,10 @@ class ExternalInferenceClient:
             "stream": False,
             "return_token_ids": True,
         }
+        decode_topk = getattr(request, "topk_logprobs", 0) or 0
+        if decode_topk:
+            payload["logprobs"] = decode_topk
+            payload["return_tokens_as_token_ids"] = True
         # vLLM's `prompt_logprobs` is an int: 0 returns just the prompt tokens'
         # own logprobs, k>0 also returns the top-k per position.
         topk_prompt_logprobs = getattr(request, "topk_prompt_logprobs", 0) or 0
@@ -168,6 +175,9 @@ class ExternalInferenceClient:
                 types.GeneratedSequence(
                     tokens=choice["token_ids"],
                     logprobs=lp["token_logprobs"],
+                    topk_logprobs=convert_vllm_decode_logprobs(
+                        choice["token_ids"], lp["token_logprobs"], lp.get("top_logprobs"), decode_topk
+                    ),
                     stop_reason=choice["finish_reason"],
                 )
             )

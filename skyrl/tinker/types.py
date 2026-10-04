@@ -145,6 +145,10 @@ class TensorData(BaseModel):
 
 
 class LossFnInputs(BaseModel):
+    topk_token_ids: TensorData = Field(default_factory=lambda: TensorData(data=[]))
+    topk_logprobs: TensorData = Field(default_factory=lambda: TensorData(data=[]))
+    reference_logprobs: TensorData = Field(default_factory=lambda: TensorData(data=[]))
+
     target_tokens: TensorData
     weights: TensorData
     advantages: TensorData
@@ -161,7 +165,17 @@ class Datum(BaseModel):
 
 class ForwardBackwardInput(BaseModel):
     data: list[Datum]
-    loss_fn: Literal["cross_entropy", "importance_sampling", "ppo", "gspo", "cispo", "ppo_critic", "dppo"]
+    loss_fn: Literal[
+        "cross_entropy",
+        "importance_sampling",
+        "ppo_score_centered",
+        "reinforce_score_centered",
+        "ppo",
+        "gspo",
+        "cispo",
+        "ppo_critic",
+        "dppo",
+    ]
     loss_fn_config: dict[str, float] | None = None
 
 
@@ -259,6 +273,7 @@ class SampleInput(BaseModel):
     prompt_logprobs: bool
     # Number of top logprobs to return per prompt position (0 disables).
     topk_prompt_logprobs: int = 0
+    topk_logprobs: int = Field(default=0, ge=0)
     # See make_routing_session_id.
     seq_id: int | None = None
     sampling_session_id: str | None = None
@@ -268,6 +283,7 @@ class GeneratedSequence(BaseModel):
     stop_reason: Literal["length", "stop"]
     tokens: list[int]
     logprobs: list[float]
+    topk_logprobs: list[list[tuple[int, float]]] | None = None
 
 
 class SampleOutput(BaseModel):
@@ -303,6 +319,9 @@ class PreparedModelPassBatch(BaseModel):
     all_token_weights: list[list[float]]
     all_sampling_logprobs: list[list[float]]
     all_advantages: list[list[float]]
+    all_topk_token_ids: list[list[int]] = Field(default_factory=list)
+    all_topk_logprobs: list[list[float]] = Field(default_factory=list)
+    all_reference_logprobs: list[list[float]] = Field(default_factory=list)
     all_values: list[list[float]]
     all_returns: list[list[float]]
     all_rollout_logprobs: list[list[float]] = Field(default_factory=list)
@@ -343,6 +362,8 @@ class PreparedSampleBatch(BaseModel):
 
 # All accepted loss functions across backends.
 SUPPORTED_LOSS_FNS = {
+    "reinforce_score_centered",
+    "ppo_score_centered",
     "cross_entropy",
     "importance_sampling",
     "ppo",

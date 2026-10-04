@@ -25,6 +25,8 @@ from skyrl.train.dataset.replay_buffer import Experience
 # Summing it would multiply the reported value by the microbatch (and DP) count -- e.g. a true
 # ~0.5 nats reads as ~44. Keep these averaged regardless of `sum_loss_metrics`.
 MEAN_LOSS_METRICS = frozenset({"mtp_loss", "draft_loss"})
+# Score-centering token counts and sums are summed over micro-batches and DP ranks.
+SCORE_CENTERING_METRICS_PREFIX = "loss_metrics/score_centering/"
 # Per-micro-batch abs diff between train-step and rollout logprobs. The moments (`_mean`,
 # `_sq_mean`) and `_max`/`_min` reduce correctly across micro-batches, DP ranks, and
 # mini-batches; the std is reconstructed from the moments downstream.
@@ -100,7 +102,9 @@ def reduce_metrics(metrics: Dict[str, List[float]], sum_loss_metrics: bool = Fal
             reduced_metrics[k] = max(v)
         elif k.endswith("_min"):
             reduced_metrics[k] = min(v)
-        elif sum_loss_metrics and (k == "loss" or k.endswith("_loss")) and k not in MEAN_LOSS_METRICS:
+        elif k.startswith(SCORE_CENTERING_METRICS_PREFIX) or (
+            sum_loss_metrics and (k == "loss" or k.endswith("_loss")) and k not in MEAN_LOSS_METRICS
+        ):
             reduced_metrics[k] = sum(v)
         else:
             reduced_metrics[k] = sum(v) / len(v)
@@ -131,7 +135,8 @@ def all_reduce_metrics(
     sum_metrics = {
         k: v
         for k, v in metrics.items()
-        if sum_loss_metrics and (k == "loss" or k.endswith("_loss")) and k not in MEAN_LOSS_METRICS
+        if k.startswith(SCORE_CENTERING_METRICS_PREFIX)
+        or (sum_loss_metrics and (k == "loss" or k.endswith("_loss")) and k not in MEAN_LOSS_METRICS)
     }
     mean_metrics = {
         k: v for k, v in metrics.items() if k not in min_metrics and k not in max_metrics and k not in sum_metrics
@@ -183,7 +188,7 @@ class BaseBatchIterator:
             rollout_sample_support=batch.get(SAMPLE_SUPPORT_FIELD),
             # additional info
             # can be used to log metrics etc for micro-batches in the worker
-            info={},
+            info={key: batch[key] for key in ("topk_token_ids", "topk_logprobs", "reference_logprobs") if key in batch},
             # propagate metadata as is
             metadata=batch.metadata,
             # Multi-modal vision fields (may be absent for text-only)
@@ -338,6 +343,9 @@ class TokenBasedBatchIterator(BaseBatchIterator):
                 "response_mask": torch.ones((batch_size, num_actions), dtype=int, device=device),
             }
         )
+        for key in ("topk_token_ids", "topk_logprobs", "reference_logprobs"):
+            if key in self.data:
+                data[key] = torch.zeros_like(self.data[key][:1])
         # Add optional fields to the padding batch.
         if self.data.get("rollout_logprobs") is not None:
             ref_tensor = self.data["rollout_logprobs"]

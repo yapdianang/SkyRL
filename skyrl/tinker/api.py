@@ -681,6 +681,13 @@ class Datum(BaseModel):
 
         return types.Datum(
             loss_fn_inputs=types.LossFnInputs(
+                topk_token_ids=(
+                    inp["topk_token_ids"].to_types() if "topk_token_ids" in inp else types.TensorData(data=[])
+                ),
+                topk_logprobs=inp["topk_logprobs"].to_types() if "topk_logprobs" in inp else types.TensorData(data=[]),
+                reference_logprobs=(
+                    inp["reference_logprobs"].to_types() if "reference_logprobs" in inp else types.TensorData(data=[])
+                ),
                 target_tokens=inp["target_tokens"].to_types(),
                 weights=weights,
                 advantages=inp["advantages"].to_types() if "advantages" in inp else types.TensorData(data=[]),
@@ -700,6 +707,14 @@ class ForwardBackwardInput(BaseModel):
         "cross_entropy": set(),
         "importance_sampling": set(),
         "ppo": {"clip_low_threshold", "clip_high_threshold", "value_clip"},
+        "ppo_score_centered": {"score_centering_k", "eps_clip_low", "eps_clip_high", "kl_loss_coef", "center_scores"},
+        "reinforce_score_centered": {
+            "score_centering_k",
+            "importance_cap",
+            "kl_loss_coef",
+            "importance_sampling",
+            "center_scores",
+        },
         "gspo": {"clip_low_threshold", "clip_high_threshold"},
         "cispo": {"clip_low_threshold", "clip_high_threshold"},
         "ppo_critic": {"value_clip"},
@@ -707,7 +722,17 @@ class ForwardBackwardInput(BaseModel):
     }
 
     data: list[Datum]
-    loss_fn: Literal["cross_entropy", "importance_sampling", "ppo", "gspo", "cispo", "ppo_critic", "dppo"]
+    loss_fn: Literal[
+        "cross_entropy",
+        "importance_sampling",
+        "ppo_score_centered",
+        "reinforce_score_centered",
+        "ppo",
+        "gspo",
+        "cispo",
+        "ppo_critic",
+        "dppo",
+    ]
     loss_fn_config: dict[str, float] | None = None
 
     @model_validator(mode="after")
@@ -832,7 +857,18 @@ class SampleRequest(BaseModel):
     seq_id: int | None = None
     prompt_logprobs: bool | None = None
     topk_prompt_logprobs: int = Field(default=0, ge=0)
+    topk_logprobs: int = Field(default=0, ge=0)
     type: Literal["sample"] = "sample"
+
+    @model_validator(mode="after")
+    def validate_decode_logprobs(self):
+        if self.topk_logprobs and (
+            self.sampling_params.temperature != 1.0
+            or self.sampling_params.top_p != 1.0
+            or self.sampling_params.top_k != -1
+        ):
+            raise ValueError("decode topk_logprobs requires temperature=1, top_p=1, top_k=-1")
+        return self
 
     @model_validator(mode="after")
     def validate_model_source(self):
@@ -1717,10 +1753,16 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         # prompt forward pass, so asking for one asks for the other.
         prompt_logprobs=bool(request.prompt_logprobs) or request.topk_prompt_logprobs > 0,
         topk_prompt_logprobs=request.topk_prompt_logprobs,
+        topk_logprobs=request.topk_logprobs,
         seq_id=request.seq_id,
         sampling_session_id=request.sampling_session_id,
     )
     external_future_store = req.app.state.external_future_store
+    if request.topk_logprobs and external_future_store is None:
+        raise HTTPException(
+            status_code=400,
+            detail="decode topk_logprobs requires external inference forwarding",
+        )
     if external_future_store is not None:
         # Every external inference mode has a store, so this branch covers all
         # forwarded samples; the DB path below is only for the internal engine.
@@ -1779,9 +1821,17 @@ async def retrieve_future(request: RetrieveFutureRequest, req: Request):
 
     status, request_type, result_data = row
     if status == RequestStatus.COMPLETED:
+        # The proto SampledSequence has no decode top-k field, so those samples stay JSON.
+        decode_heads = (
+            types.RequestType(request_type) in (types.RequestType.SAMPLE, types.RequestType.EXTERNAL)
+            and result_data is not None
+            and any(sequence.get("topk_logprobs") is not None for sequence in json.loads(result_data)["sequences"])
+        )
+        if decode_heads and PROTO_CONTENT_TYPE in req.headers.get("accept", "").lower():
+            raise HTTPException(status_code=406, detail="decode topk_logprobs requires Accept: application/json")
         # The SDK only accepts sample/forward/forward_backward results in proto
         # wire format. Errors and other result types stay JSON.
-        if types.RequestType(request_type) in PROTO_SERIALIZABLE_REQUEST_TYPES:
+        if types.RequestType(request_type) in PROTO_SERIALIZABLE_REQUEST_TYPES and not decode_heads:
             # Forwarded samples are stored as proto already and go out as-is;
             # anything stored as JSON is encoded once here and cached.
             content = external_future_store.proto_result(request_id) if found_in_memory else None
