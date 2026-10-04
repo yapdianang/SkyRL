@@ -15,6 +15,7 @@ from skyrl.backends.utils import (
 from skyrl.tinker import types
 from skyrl.tinker.config import EngineConfig
 from skyrl.tinker.db_models import FutureDB, RequestStatus
+from skyrl.tinker.decode_heads import DecodeHeadCache
 from skyrl.utils.log import logger
 from skyrl.utils.storage import download_and_unpack
 
@@ -43,6 +44,8 @@ def _extract_checkpoint_sync(checkpoint_path: AnyPath, target_dir: Path) -> None
 
 class ExternalInferenceClient:
     """Client for calling external inference engines (e.g., vLLM)."""
+
+    decode_heads: DecodeHeadCache | None = None
 
     # TODO: make `external_future_store` required and remove the FutureDB
     # write-back path in `call_and_store_result` — every production
@@ -138,8 +141,9 @@ class ExternalInferenceClient:
             "return_token_ids": True,
         }
         decode_topk = getattr(request, "topk_logprobs", 0) or 0
-        if decode_topk:
-            payload["logprobs"] = decode_topk
+        record_topk = self.decode_heads.record_topk(request.sampling_params) if self.decode_heads else 0
+        if decode_topk or record_topk:
+            payload["logprobs"] = max(decode_topk, record_topk)
             payload["return_tokens_as_token_ids"] = True
         # vLLM's `prompt_logprobs` is an int: 0 returns just the prompt tokens'
         # own logprobs, k>0 also returns the top-k per position.
@@ -171,6 +175,10 @@ class ExternalInferenceClient:
         sequences = []
         for choice in result["choices"]:
             lp = choice["logprobs"]
+            if record_topk:
+                self.decode_heads.record(
+                    prompt_tokens, choice["token_ids"], lp["token_logprobs"], lp.get("top_logprobs")
+                )
             sequences.append(
                 types.GeneratedSequence(
                     tokens=choice["token_ids"],

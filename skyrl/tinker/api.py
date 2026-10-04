@@ -32,7 +32,11 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel, func, select, update
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from skyrl.env_vars import SKYRL_HTTP_CONNECTION_LIMIT
+from skyrl.env_vars import (
+    SKYRL_HTTP_CONNECTION_LIMIT,
+    SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES,
+    SKYRL_SCORE_CENTERING_RECORD_TOPK,
+)
 from skyrl.tinker import types
 from skyrl.tinker.config import (
     EngineConfig,
@@ -53,6 +57,7 @@ from skyrl.tinker.db_models import (
     enable_sqlite_wal,
     get_async_database_url,
 )
+from skyrl.tinker.decode_heads import TURN_ENDS_KEY, DecodeHeadCache
 from skyrl.tinker.external_future_store import ExternalFutureStore
 from skyrl.tinker.extra import (
     ExternalInferenceClient,
@@ -378,6 +383,20 @@ async def lifespan(app: FastAPI):
     else:
         app.state.external_inference_client = None
         logger.info("Using internal engine for inference")
+
+    # Forwarded samples bypass the engine subprocess, so this process records their heads for forward_backward.
+    app.state.decode_heads = None
+    if SKYRL_SCORE_CENTERING_RECORD_TOPK:
+        if app.state.external_inference_client is None:
+            raise RuntimeError("SKYRL_SCORE_CENTERING_RECORD_TOPK requires sample forwarding in the API server")
+        app.state.decode_heads = DecodeHeadCache(
+            SKYRL_SCORE_CENTERING_RECORD_TOPK, SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES
+        )
+        app.state.external_inference_client.decode_heads = app.state.decode_heads
+        logger.info(
+            f"Recording decode top-{SKYRL_SCORE_CENTERING_RECORD_TOPK} heads "
+            f"(cap {SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES} bytes)"
+        )
 
     # Build subprocess command with engine config parameters.
     parent_cmd = psutil.Process(os.getppid()).cmdline()
@@ -905,6 +924,11 @@ class FutureResponse(BaseModel):
     future_id: str
     status: str = "pending"
     request_id: str
+
+
+class SampleFutureResponse(FutureResponse):
+    # tinker SDK >= 0.27 asserts one id per sample and stamps it on SampledSequence.sequence_id.
+    sample_sequence_ids: list[str]
 
 
 class TelemetryEvent(BaseModel):
@@ -1503,10 +1527,44 @@ async def _read_forward_backward_request(request: Request) -> tuple[ForwardBackw
         raise FastAPIRequestValidationError(e.errors())
 
 
+def _resolve_turn_ends(fb_input: ForwardBackwardInput, decode_heads: DecodeHeadCache | None) -> None:
+    """Replace each datum's score_centering_turn_ends with the recorded decode heads, in place."""
+    uses_turn_ends = [TURN_ENDS_KEY in datum.loss_fn_inputs for datum in fb_input.data]
+    if not any(uses_turn_ends):
+        return
+    if not all(uses_turn_ends) or any(
+        key in datum.loss_fn_inputs for datum in fb_input.data for key in ("topk_token_ids", "topk_logprobs")
+    ):
+        raise ValueError(f"Each datum of a batch must supply {TURN_ENDS_KEY}, or none may")
+    if decode_heads is None:
+        raise ValueError(f"{TURN_ENDS_KEY} requires SKYRL_SCORE_CENTERING_RECORD_TOPK on the server")
+    if fb_input.loss_fn not in ("ppo_score_centered", "reinforce_score_centered"):
+        raise ValueError(f"{TURN_ENDS_KEY} requires a score-centered loss")
+    k = (fb_input.loss_fn_config or {}).get("score_centering_k", 0)
+    if k < 1 or k != int(k):
+        raise ValueError("score_centering_k must be a positive integer")
+    for datum in fb_input.data:
+        if not all(isinstance(chunk, EncodedTextChunk) for chunk in datum.model_input.chunks):
+            raise ValueError(f"{TURN_ENDS_KEY} requires text-only model input")
+        inputs = datum.loss_fn_inputs
+        model_tokens = [token for chunk in datum.model_input.chunks for token in chunk.tokens]
+        targets = inputs["target_tokens"].data
+        weights = inputs["weights"].data if "weights" in inputs else [1.0] * len(targets)
+        if len(targets) != len(model_tokens) or len(weights) != len(targets) or targets[:-1] != model_tokens[1:]:
+            raise ValueError("target_tokens and weights must align with model_input tokens shifted by one")
+        ids, logprobs = decode_heads.place(model_tokens + targets[-1:], inputs.pop(TURN_ENDS_KEY).data, weights, int(k))
+        inputs["topk_token_ids"] = TensorData(data=ids)
+        inputs["topk_logprobs"] = TensorData(data=logprobs)
+
+
 @app.post("/api/v1/forward_backward", response_model=FutureResponse)
 async def forward_backward(request: Request, session: AsyncSession = Depends(get_session)):
     """Compute and accumulate gradients (or run forward-only when the proto body asks for it)."""
     req, forward_only = await _read_forward_backward_request(request)
+    try:
+        _resolve_turn_ends(req.forward_backward_input, getattr(request.app.state, "decode_heads", None))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     async with request.app.state.db_write_lock:
         await get_model(session, req.model_id)
         request_id = await create_future(
@@ -1714,7 +1772,7 @@ async def validate_sampler_checkpoint_once(
         validated.add(key)
 
 
-@app.post("/api/v1/asample", response_model=FutureResponse)
+@app.post("/api/v1/asample", response_model=SampleFutureResponse)
 async def asample(request: SampleRequest, req: Request, session: AsyncSession = Depends(get_session)):
     """Generates samples from the model (async version)."""
     if request.sampling_session_id is not None and ":" in request.sampling_session_id:
@@ -1781,7 +1839,12 @@ async def asample(request: SampleRequest, req: Request, session: AsyncSession = 
         )
         await session.commit()
 
-    return FutureResponse(future_id=str(request_id), status="pending", request_id=str(request_id))
+    return SampleFutureResponse(
+        future_id=str(request_id),
+        status="pending",
+        request_id=str(request_id),
+        sample_sequence_ids=[uuid4().hex for _ in range(request.num_samples)],
+    )
 
 
 @app.get("/api/v1/get_server_capabilities", response_model=GetServerCapabilitiesResponse)

@@ -83,6 +83,17 @@ Only takes effect with backends that expose the per-request async sample path
 Default: True. Set ``SKYRL_TINKER_CONTINUOUS_SAMPLING=0`` to use the batched loop.
 """
 
+SKYRL_SCORE_CENTERING_RECORD_TOPK = int(os.environ.get("SKYRL_SCORE_CENTERING_RECORD_TOPK") or 0)
+"""
+Decode top-k heads that the API server requests from vLLM and records for every forwarded
+sample, for ``score_centering_turn_ends`` lookups. Default 0 disables recording.
+"""
+
+SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES = int(os.environ.get("SKYRL_SCORE_CENTERING_RECORD_MAX_BYTES", 8 << 30))
+"""
+Byte cap of the recorded decode heads; the least recently used entries are evicted. Default 8 GiB.
+"""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Runtime Environment Exports
 # ─────────────────────────────────────────────────────────────────────────────
