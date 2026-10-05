@@ -88,7 +88,7 @@ def test_tail_extremes_and_mask(head_q):
     assert hp.grad[0, 1].count_nonzero() == 0
 
 
-def test_alignment_and_request_global_normalization():
+def test_alignment_and_caller_normalized_weights():
     prepared = SimpleNamespace(
         all_loss_fns=["ppo_score_centered"] * 2,
         all_loss_fn_configs=[{"score_centering_k": 2}] * 2,
@@ -101,9 +101,11 @@ def test_alignment_and_request_global_normalization():
         all_reference_logprobs=[[], []],
         request_batch_slices=[("r", "m", 0, 2)],
     )
-    batch = {"loss_mask": torch.tensor([[1.0, 0, 1], [0, 0, 1]])}
+    weights = torch.tensor([[0.25, 0, 0.25], [0, 0, 0.5]])
+    batch = {"loss_mask": weights.clone()}
     add_score_centering_inputs(batch, prepared, 3)
-    torch.testing.assert_close(batch["loss_mask"].sum(), torch.tensor(1.0))
+    # Weights stay as the client normalized them across every request of its forward_backward.
+    torch.testing.assert_close(batch["loss_mask"], weights)
     assert batch["topk_token_ids"][1].tolist() == [[0, 0], [0, 0], [4, 5]]
     assert torch.isfinite(batch["topk_logprobs"]).all()
 

@@ -81,13 +81,8 @@ def add_score_centering_inputs(batch, prepared, response_length):
     weights = batch["loss_mask"]
     if not torch.isfinite(weights).all() or (weights < 0).any() or weights.sum() <= 0:
         raise ValueError("Score centering requires finite nonnegative action weights with positive sum")
-    normalized = weights.clone()
-    for _, _, start, end in prepared.request_batch_slices:
-        count = weights[start:end].sum()
-        if count <= 0:
-            raise ValueError("Each score-centered request needs action tokens")
-        normalized[start:end] /= count
-    batch["loss_mask"] = normalized
+    # The client normalizes weights over its whole forward_backward; the SDK may split that call into
+    # several requests, so normalizing per request would reweight tokens by which request they landed in.
 
 
 def _describe_nonfinite(values, logp, old, head_p, head_q) -> str:
