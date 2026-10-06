@@ -47,6 +47,9 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     pack_routed_experts,
     pack_sample_support,
 )
+from skyrl.backends.skyrl_train.inference_servers.lora_cache_salt import (
+    LoraCacheSaltMiddleware,
+)
 from skyrl.backends.skyrl_train.inference_servers.protocols import ServerActorProtocol
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPE,
@@ -462,6 +465,9 @@ class VLLMServerActor(ServerActorProtocol):
         # adds /fetch_weights because checkpoint-delta pulls and applies
         # payloads before the paused /update_weights reload.
 
+        lora_loads: dict[str, int] = {}
+        app.add_middleware(LoraCacheSaltMiddleware, loads=lora_loads)
+
         @app.post("/reset_prefix_cache")
         async def _reset_prefix_cache(request: Request):
             """Reset the prefix cache, optionally resetting in-flight requests too."""
@@ -530,6 +536,7 @@ class VLLMServerActor(ServerActorProtocol):
                 await models.engine_client.add_lora(lora_request)
                 lora_request.load_inplace = False
                 models.lora_requests[lora_name] = lora_request
+                lora_loads[lora_name] = lora_loads.get(lora_name, 0) + 1
 
             return {
                 "status": "ok",
