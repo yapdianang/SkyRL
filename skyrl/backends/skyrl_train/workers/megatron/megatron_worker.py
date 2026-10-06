@@ -1701,15 +1701,14 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             # before we get here; sync that adapter to vLLM under its own name
             # so sample(model=<model_id>) routes correctly. Single-tenant
             # (model_id=None) keeps the legacy shared path + name.
-            cache_reset_task = self._reset_prefix_cache_task(inference_engine_client, inference_engine_cfg)
+            # The servers salt each adapter's prefix cache by its load count (lora_cache_salt.py), so an
+            # in-place reload needs no engine-wide reset that would also drop every other adapter's cache.
             torch.cuda.empty_cache()
             lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
             if self._lora_sync_mode_is_memory():
                 await self._publish_lora_adapter_in_memory(lora_name, inference_engine_client)
             else:
                 await self._save_lora_adapters_and_sync(lora_sync_path, inference_engine_client, lora_name=lora_name)
-            if cache_reset_task is not None:
-                await cache_reset_task
             if self.cfg.placement.colocate_all:
                 torch.cuda.empty_cache()
             torch.distributed.barrier()
