@@ -465,8 +465,10 @@ class VLLMServerActor(ServerActorProtocol):
         # adds /fetch_weights because checkpoint-delta pulls and applies
         # payloads before the paused /update_weights reload.
 
+        # build_app has already built the middleware stack, so the server wraps the app with
+        # LoraCacheSaltMiddleware around these counts instead of registering it here.
         lora_loads: dict[str, int] = {}
-        app.add_middleware(LoraCacheSaltMiddleware, loads=lora_loads)
+        app.state.lora_loads = lora_loads
 
         @app.post("/reset_prefix_cache")
         async def _reset_prefix_cache(request: Request):
@@ -730,7 +732,7 @@ async def _build_and_serve_vllm_server(
 
     # Use uvicorn directly (serve_http tries to add signal handlers which fails in Ray actors)
     config = uvicorn.Config(
-        app,
+        LoraCacheSaltMiddleware(app, app.state.lora_loads),
         host=cli_args.host,
         port=cli_args.port,
         log_level=cli_args.uvicorn_log_level,
